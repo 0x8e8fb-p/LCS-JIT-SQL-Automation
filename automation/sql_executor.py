@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 import re
 import time
 from pathlib import Path
@@ -98,6 +99,26 @@ def discover_scripts(path: Path) -> list[Path]:
         raise AutomationError('configuration', 'SQL_SCRIPTS_PATH must be a readable folder containing .sql files.') from None
 
 
+@dataclass(frozen=True)
+class PreparedScript:
+    name: str
+    batches: tuple[str, ...]
+
+
+def prepare_scripts(path: Path) -> list[PreparedScript]:
+    """Snapshot reviewed batches before any grant; do not reread files afterward."""
+    prepared = []
+    for file in validate_scripts(path):
+        try:
+            batches = tuple(split_batches(file.read_text(encoding='utf-8-sig')))
+        except (OSError, UnicodeError):
+            raise AutomationError('configuration', 'Cannot snapshot SQL scripts. Check permissions and UTF-8 encoding.') from None
+        if not batches:
+            raise AutomationError('configuration', 'A SQL script became empty before execution; no access was requested.')
+        prepared.append(PreparedScript(file.name, batches))
+    return prepared
+
+
 def validate_scripts(path: Path) -> list[Path]:
     """Reject unreadable/unsupported/empty scripts before granting any access."""
     files = discover_scripts(path)
@@ -138,8 +159,8 @@ def safe_sql_error(error: pyodbc.Error) -> str:
     return f'SQL operation failed (SQLSTATE {state}). Check permissions, T-SQL syntax, query timeout, and JIT/firewall validity; driver details suppressed for security.'
 
 
-def execute_sql_scripts(credentials: Credentials, config: Config, files: list[Path] | None = None) -> dict[str, Any]:
-    files = discover_scripts(config.scripts_path) if files is None else files
+def execute_sql_scripts(credentials: Credentials, config: Config, files: list[Path] | list[PreparedScript] | None = None) -> dict[str, Any]:
+    files = prepare_scripts(config.scripts_path) if files is None else files
     results: dict[str, Any] = {
         'total_scripts': len(files), 'scripts_executed': 0, 'scripts_failed': 0,
         'execution_time_seconds': 0.0, 'details': [],
@@ -183,7 +204,7 @@ def execute_sql_scripts(credentials: Credentials, config: Config, files: list[Pa
             try:
                 credentials.ensure_valid()
                 # Read/validate complete script before executing any batch.
-                batches = split_batches(file.read_text(encoding='utf-8-sig'))
+                batches = file.batches if isinstance(file, PreparedScript) else split_batches(file.read_text(encoding='utf-8-sig'))
                 if not batches:
                     raise AutomationError('script_execution', 'SQL script is empty.')
                 cursor = connection.cursor()

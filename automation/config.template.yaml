@@ -1,0 +1,14 @@
+# Paste the complete LCS sandbox environment-details URL (including EnvironmentId).
+ENVIRONMENT_URL: ""
+
+# Exact LCS reason determines permissions. Change only to an approved option.
+# Read-write AX: "Performance tuning for AX (write to AX)"
+# MR: "MR troubleshooting (read-only to MR)"
+# AXDW: "Troubleshooting and tuning entity store (write to AXDW)"
+ACCESS_REASON: "AX troubleshooting (read-only to AX)"
+
+# Approved justification for the Request access block.
+ACCESS_DETAILS: ""
+
+# Temporary firewall rule; an existing conflicting rule is never overwritten.
+FIREWALL_RULE_NAME: "lcsjit"

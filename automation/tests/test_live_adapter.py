@@ -146,7 +146,14 @@ def test_browser_grid_add_cleanup_with_stale_modal_layer(tmp_path, monkeypatch):
     from automation_support import utcnow
     import lcs_jit_automation as lcs
 
-    config = Config.load(Path(__file__).resolve().parents[2] / 'config.yaml')
+    import yaml
+    profile = tmp_path / 'config.yaml'
+    profile.write_text(yaml.safe_dump({
+        'ENVIRONMENT_URL': 'https://lcs.dynamics.com/V2/EnvironmentDetailsV3New/123?EnvironmentId=11111111-2222-4333-8444-555555555555',
+        'ACCESS_REASON': 'AX troubleshooting (read-only to AX)',
+        'ACCESS_DETAILS': 'Fixture validation', 'FIREWALL_RULE_NAME': 'test',
+    }))
+    config = Config.load(profile)
     config.state_path = tmp_path / 'auth.enc'
     config.auth_key_path = None
     monkeypatch.setenv('LCS_AUTH_KEY', Fernet.generate_key().decode())
@@ -197,7 +204,9 @@ def test_browser_grid_add_cleanup_with_stale_modal_layer(tmp_path, monkeypatch):
                 r.fulfill(content_type='text/html', body=html())
         instance.context.route('https://lcs.dynamics.com/**', route)
         try:
+            assert config.environment_id == ''
             instance.navigate()
+            assert config.environment_id == 'contoso-sandbox'
             instance.enable_ip('8.8.8.8')
             assert instance.rule_created is True
             assert instance.rule_name == 'test'

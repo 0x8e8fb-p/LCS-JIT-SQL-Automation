@@ -18,6 +18,15 @@ import uuid
 import yaml
 
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    """YAML duplicate keys are errors, not silent last-value-wins overrides."""
+    def construct_mapping(self, node: yaml.nodes.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        keys = [self.construct_object(key, deep=deep) for key, _ in node.value]
+        if len(set(keys)) != len(keys):
+            raise ValueError('Duplicate YAML key')
+        return dict(super().construct_mapping(node, deep=deep))
+
+
 class AutomationError(Exception):
     def __init__(self, step: str, message: str):
         super().__init__(message)
@@ -141,13 +150,17 @@ class Config:
     @classmethod
     def load(cls, path: Path, *, bootstrap: bool = False) -> Config:
         try:
-            raw = yaml.safe_load(path.read_text(encoding='utf-8'))
+            raw = yaml.load(path.read_text(encoding='utf-8-sig'), Loader=UniqueKeyLoader)
             if not isinstance(raw, dict):
                 raise ValueError('mapping required')
-            data: dict[str, Any] = dict(raw)
+            data: dict[str, Any] = {key: value.strip() if isinstance(value, str) else value for key, value in raw.items()}
+            minimal_keys = {'ENVIRONMENT_URL', 'ACCESS_REASON', 'ACCESS_DETAILS', 'FIREWALL_RULE_NAME'}
+            if 'selectors' not in data:
+                if set(data) - minimal_keys or any(key in os.environ for key in ENV_KEYS - minimal_keys):
+                    raise ValueError('Advanced settings require an explicit selectors profile; remove stale environment overrides')
             for key in ENV_KEYS:
                 if key in os.environ:
-                    data[key] = os.environ[key]
+                    data[key] = os.environ[key].strip()
             # URL-only profiles receive internal defaults; explicit legacy profiles
             # with selectors keep their existing behavior for calibrated overrides.
             if data.get('ENVIRONMENT_URL') and 'selectors' not in data:
@@ -158,10 +171,11 @@ class Config:
             if data.get('ENVIRONMENT_URL'):
                 target = urlsplit(str(data['ENVIRONMENT_URL']))
                 match = re.fullmatch(r'/V2/EnvironmentDetailsV3New/(\d+)', target.path)
-                ids = parse_qs(target.query).get('EnvironmentId', [])
-                if target.scheme != 'https' or target.netloc != 'lcs.dynamics.com' or not match or len(ids) != 1:
+                ids = parse_qs(target.query, keep_blank_values=True).get('EnvironmentId', [])
+                if target.scheme != 'https' or target.netloc != 'lcs.dynamics.com' or target.fragment or not match or len(ids) != 1:
                     raise ValueError('Paste a complete HTTPS LCS environment-details URL')
-                uuid.UUID(ids[0])
+                if str(uuid.UUID(ids[0])) != ids[0]:
+                    raise ValueError('EnvironmentId must be a canonical lowercase GUID')
                 derived_project = match.group(1)
                 if 'LCS_PROJECT_ID' in data and data['LCS_PROJECT_ID'] != derived_project:
                     raise ValueError('LCS_PROJECT_ID conflicts with ENVIRONMENT_URL')
@@ -293,4 +307,4 @@ class Config:
                        key_path)
         except (OSError, ValueError, TypeError, yaml.YAMLError):
             # YAML/parser errors may quote secret-bearing config lines.
-            raise AutomationError('configuration', 'Invalid configuration. Paste a complete HTTPS LCS environment URL, an exact supported ACCESS_REASON, non-empty ACCESS_DETAILS, and a valid FIREWALL_RULE_NAME. See automation/README.md for advanced profiles.') from None
+            raise AutomationError('configuration', 'Invalid configuration. Paste a complete HTTPS LCS environment URL, an exact supported ACCESS_REASON, non-empty ACCESS_DETAILS, and a valid FIREWALL_RULE_NAME. Remove duplicate YAML keys/stale advanced environment overrides. See automation/README.md for advanced profiles.') from None

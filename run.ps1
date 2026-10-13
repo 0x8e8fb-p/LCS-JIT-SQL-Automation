@@ -39,9 +39,19 @@ try {
     if ([string]::IsNullOrWhiteSpace($Config)) { throw 'Config path cannot be empty.' }
     if (-not [IO.Path]::IsPathRooted($Config)) { $Config = Join-Path $PSScriptRoot $Config }
     $Config = [IO.Path]::GetFullPath($Config)
-    if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) { throw "Config file not found: $Config" }
-
     $AppDir = Join-Path $PSScriptRoot 'automation'
+    if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
+        $DefaultConfig = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'config.yaml'))
+        $Template = Join-Path $AppDir 'config.template.yaml'
+        if ($Config -eq $DefaultConfig -and -not (Test-Path -LiteralPath $Config) -and (Test-Path -LiteralPath $Template -PathType Leaf)) {
+            # Exclusive creation: never overwrite another user's configuration.
+            $Content = [IO.File]::ReadAllBytes($Template)
+            $NewConfig = [IO.File]::Open($Config, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $NewConfig.Write($Content, 0, $Content.Length) } finally { $NewConfig.Dispose() }
+            throw "Created $Config from the safe template. Set ENVIRONMENT_URL and ACCESS_DETAILS, review the reason/rule name, then rerun ./run.ps1. No prerequisites or access changes were made. Instructions: automation/README.md"
+        }
+        throw "Config file not found: $Config"
+    }
     $Main = Join-Path $AppDir 'main.py'
     $Setup = Join-Path $AppDir 'setup.ps1'
     if (-not (Test-Path -LiteralPath $Setup) -or -not (Test-Path -LiteralPath $Main)) {

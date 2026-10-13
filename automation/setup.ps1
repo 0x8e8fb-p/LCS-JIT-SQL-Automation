@@ -115,9 +115,9 @@ function Invoke-PythonStep {
 }
 
 function Test-PythonPackages {
-    param([string]$Python)
+    param([string]$Python, [string]$Requirements)
     $ErrorActionPreference = 'Continue'
-    & $Python -c 'import playwright.sync_api, pyodbc, yaml, cryptography.fernet' *> $null
+    & $Python -c 'import playwright.sync_api, pyodbc, yaml, cryptography.fernet; import sys; from importlib.metadata import version; from pathlib import Path; lines=Path(sys.argv[1]).read_text().splitlines(); pins=[line.strip().split(''=='') for line in lines if line.strip() and not line.lstrip().startswith(''#'')]; sys.exit(0 if all(len(p)==2 and version(p[0])==p[1] for p in pins) else 1)' $Requirements *> $null
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -133,6 +133,11 @@ function Initialize-Prerequisites {
     if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem -or
         $env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') {
         throw 'Automatic setup supports Windows 10/11 or Server (x64) only; ARM64, 32-bit Windows, macOS and Linux need a separate installer.'
+    }
+    foreach ($Name in @('main.py', 'automation_support.py', 'lcs_jit_automation.py', 'sql_executor.py', 'requirements.txt', 'defaults.yaml')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $AppDir $Name) -PathType Leaf)) {
+            throw "Incomplete download: automation/$Name is missing. Extract the whole repository before running."
+        }
     }
     $Version = [Environment]::OSVersion.Version
     if ($Version.Major -lt 10 -or $Version.Build -lt 17763) { throw 'Windows 10 1809 / Server 2019 or newer is required.' }
@@ -156,13 +161,14 @@ function Initialize-Prerequisites {
     $Stamp = Join-Path $AppDir '.venv/requirements.sha256'
     $Hash = (Get-FileHash -LiteralPath $Requirements -Algorithm SHA256).Hash
     if (-not (Test-Path -LiteralPath $Stamp) -or (Get-Content -LiteralPath $Stamp -Raw).Trim() -ne $Hash -or
-        -not (Test-PythonPackages $Py)) {
+        -not (Test-PythonPackages $Py $Requirements)) {
         Write-Host 'Installing/verifying Python dependencies...'
-        Invoke-PythonStep $Py @('-m', 'pip', 'install', '--disable-pip-version-check', '-r', $Requirements) 'Python dependencies failed to install. Check Internet/proxy access and automation/requirements.txt.'
-        Invoke-PythonStep $Py @('-m', 'pip', 'check') 'Python dependency compatibility check failed.'
-        if (-not (Test-PythonPackages $Py)) { throw 'Installed Python dependencies could not be imported.' }
+        Invoke-PythonStep $Py @('-m', 'pip', 'install', '--disable-pip-version-check', '--only-binary=:all:', '-r', $Requirements) 'Python dependencies failed to install. Check Internet/proxy access and automation/requirements.txt.'
+        if (-not (Test-PythonPackages $Py $Requirements)) { throw 'Installed Python dependencies could not be imported.' }
         Set-Content -LiteralPath $Stamp -Value $Hash -Encoding ASCII
     }
+    # Check repeat runs too; imports alone do not establish compatibility.
+    Invoke-PythonStep $Py @('-m', 'pip', 'check') 'Python dependency compatibility check failed. Repair the project-local environment before running.'
     if (-not (Test-SqlDriver $Py)) {
         Install-SqlDriver $AppDir
         if (-not (Test-SqlDriver $Py)) { throw 'ODBC driver still unavailable. Review automation/runtime/installers/odbc-install.log and rerun after any required restart.' }

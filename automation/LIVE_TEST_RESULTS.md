@@ -1,6 +1,54 @@
-# Live verification — LCS sandbox (2026-10-08)
+# Setup verification and historical live results
 
-## Current outcome
+## Latest end-to-end audit — 2026-10-13
+
+**Current result: real SQL execution and owned-rule cleanup verified through the root launcher.** The earlier connectivity-only conclusion below is historical and is superseded by this audit.
+
+### Confirmed inconsistencies repaired
+
+- A GitHub clone had no `config.yaml` because the personal config is ignored. The launcher now exclusively creates a safe four-field config from the versioned `automation/config.template.yaml`, then stops before setup/access changes so the user can fill it in. Existing configs are never overwritten; missing alternate configs are not silently created.
+- Floating package versions and import-only probes could diverge across fresh/repeat runs. Runtime and transitive dependencies are now pinned to the verified versions; setup verifies versions/imports, installs wheels only and runs `pip check` every time. Incomplete downloads fail before installation.
+- Duplicate YAML keys could silently replace settings; outer whitespace/BOM handling and ambiguous environment GUID/query inputs were inconsistent. Duplicate keys and ambiguous/noncanonical target identities now fail closed; BOM/outer whitespace work. Stale advanced environment overrides cannot silently disable cleanup or redirect scripts/auth in a minimal profile.
+- Script files were validated before JIT but rediscovered/read afterward. The CLI now snapshots the exact ordered batches before access changes; edits/additions during setup cannot silently alter that run's SQL.
+- Diagnostic disk failures could obscure cleanup errors. Auxiliary diagnostic failures are now explicitly recorded while preserving cleanup/browser outcomes. Final report-write failure remains fatal.
+- A stale fixed-name encrypted temp file could block login refresh. Auth writes use unique exclusive encrypted temporary files and clean them up.
+- Browser mutations now reverify environment identity; recognized Entra login redirects are classified as authentication rather than an environment error. Tests no longer depend on a user's personal root config.
+
+### Verified artifacts and checks
+
+- Actual `./run.ps1`, existing same-identity encrypted login, root four-field config, and exactly the two reviewed SELECT-only scripts: **exit 0**, report **success**, **2 scripts executed**, **0 failed**, expected connectivity result `[[1]]`, and **cleanup success**. Measured automation pipeline: **223.156 seconds**; SQL execution: **1.031 seconds**. This is one sample-input measurement, not an every-run timing guarantee.
+- Evidence: `automation/logs/audit_live_launcher.log`, `.exit`, and `automation/logs/2026-10-13_09-30-37_653310/report.json`. Credentials stayed encrypted/in-memory; no password is included here.
+- A separate fresh browser reopened the verified firewall grid afterward: **0 firewall rules**, automation rule absent. Evidence: `automation/logs/audit_independent_firewall.json`.
+- A source-only download-style copy (tracked working-tree files plus new source files, no virtual environment/auth/runtime) created the safe config, then installed a real fresh virtual environment, pinned dependencies and Chromium. Local/runtime validation passed with **exit 0**; repeat validation from another working directory passed without reinstalling. Evidence: `audit_download_setup.log`, `.exit`, and `audit_download_repeat.log`.
+- Windows x64 **Python 3.10** wheels for all pins downloaded successfully; the pin set also resolved in the previously installed **Python 3.13.16** clean-copy interpreter. Actual code/tests ran on Python 3.11; wheel resolution is not full runtime certification of every minor version.
+- A second actual `./run.ps1 -Headless` run passed with **exit 0**, **2 executed / 0 failed**, connectivity result `[[1]]`, and successful owned-rule cleanup. Pipeline: **176.765 seconds**; SQL: **0.875 seconds**. Evidence: `audit_live_repeat.log`, `.exit`, `2026-10-13_09-36-33_518217/report.json`. A separate final browser inspection again found **0 firewall rules** (`audit_final_verification.json`). The visible/headless timings are observations, not a speedup claim or timing guarantee.
+- Final regression suite: **88 passed**. Typechecking of all four runtime modules passed. Tests cover configuration, bootstrap orchestration, browser fixtures, SQL mock transactions, script snapshots, audit-write failures, version drift and encrypted login. Two launcher tests briefly failed while the real run intentionally held its local lock; they passed after the live run ended, and the final full suite passed without skips or weakened assertions.
+
+### Limits
+
+No pristine VM was available. The host already has Microsoft ODBC Driver 17, so actual missing-driver/UAC installation of Driver 18.7 is **not certified**; official download/signature and mocked install/failure/restart branches are verified. Python-missing installation was exercised with a real local installer in the earlier clean-copy test below, not by uninstalling host Python. Interactive MFA/UAC still require user action. Only approved SELECT samples ran against this one LCS-managed sandbox; no arbitrary writes, other tenants, PPAC, other OS/architectures or unattended expired-MFA recovery are certified. Local locks do not serialize manual operations/other machines, and termination/power loss cannot guarantee cleanup. The repository changes have not been committed or pushed by this audit; a remote GitHub download receives them only after an authorized publication step.
+
+## Simplified setup verification — 2026-10-13
+
+Delivered interface: root **`run.ps1`**, **`config.yaml`**, **`sql_scripts/`**, and **`automation/`** only (excluding hidden Git metadata). Implementation, setup helpers, defaults, advanced profile, docs, tests, logs, authentication and generated runtime are inside `automation/`. The normal config contains exactly `ENVIRONMENT_URL`, `ACCESS_REASON`, `ACCESS_DETAILS`, and `FIREWALL_RULE_NAME`; URL identity, permission metadata, installed ODBC driver and encrypted-auth paths are derived internally.
+
+Verified through Windows PowerShell 5 and the actual root launcher:
+
+- `./run.ps1 -ValidateOnly` automatically installed missing **project-local Chromium** and passed configuration/script/runtime validation for the two sample scripts. Exit **0**.
+- A clean source copy under `automation/runtime/fresh setup verification/` started with **no copied Python, virtual environment, packages, browser or auth files**. Its `Find-SupportedPython` discovery helper alone was overridden to return none, exercising the no-system-Python branch without uninstalling the host's interpreter. Everything else used real download/verification/installation and launcher logic.
+- That copy downloaded Python **3.13.16**, checked the official SHA-256 and Python Software Foundation Authenticode signature, installed it locally, created a fresh virtual environment, installed requirements, passed `pip check`, downloaded Chromium and passed runtime validation. Exit **0**. `sys.base_prefix` was checked against the copy's local `automation/runtime/python/`; Python version was checked as **3.13.16**.
+- A repeat invocation from a different working directory passed without installation output. No authentication files were copied or created by validation. Evidence: `automation/logs/fresh_setup.log`, `fresh_setup.exit`, `fresh_setup_repeat.log` and `setup_validation.log`.
+- The official **ODBC Driver 18.7.1.1 x64 MSI** downloaded successfully and its Authenticode status was **Valid**, publisher **Microsoft Corporation**. The real machine already has Driver 17, which validation used. **The MSI was not installed** and the existing system driver was not replaced. Missing-driver orchestration, signature/checksum refusal and installer failure/restart exit codes were tested with mocks. UAC approval/driver installation on a pristine host is still not live-verified.
+- Typechecking passed for the four runtime Python modules. The complete suite plus final affected-test reruns passed **69 tests**, covering four-field configuration, internal paths, Driver 17/18 selection, stable environment locking, launcher modes/exit propagation, setup first/repeat runs, invalid installer refusal, encrypted auth, browser fixtures, SQL mock transactions and cleanup.
+- Relocation initially exposed test-import failures, fixed by internal `pytest.ini`. A real first-run check also exposed PowerShell 5 treating expected native stderr from a missing Chromium probe as fatal; probes now retain false/exit-code semantics while leaving the caller's strict error policy intact. Both fixes were rerun successfully.
+
+**Scope/limitations:** this is a real clean-copy setup test on the existing Windows x64 host, not a pristine VM or cross-platform certification. MFA/UAC/corporate policies and network access can require user/admin action. No LCS grant or live SQL execution was performed for this packaging/setup change. Browser regression fixtures pass, but they do not replace live tenant or SQL verification. At that earlier setup-only check no new live SQL run was attempted. The latest end-to-end audit above supersedes its connectivity conclusion.
+
+## Historical live verification — LCS sandbox (2026-10-08)
+
+The following evidence predates the folder/config simplification. Historical paths written as `logs/...` now reside under **`automation/logs/...`**. Historical test counts and explicit Driver 17 configuration describe that earlier run, not a new live run of the simplified launcher.
+
+### Outcome
 
 **Browser automation verified live; SQL execution remains blocked by connectivity.**
 

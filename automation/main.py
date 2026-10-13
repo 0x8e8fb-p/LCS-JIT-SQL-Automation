@@ -14,10 +14,18 @@ from playwright.sync_api import sync_playwright
 
 from automation_support import AutomationError, Config, Credentials, environment_lock, timestamp, utcnow
 from lcs_jit_automation import LCSAutomation, get_public_ip, save_auth
-from sql_executor import execute_sql_scripts, scrub, validate_scripts
+from sql_executor import PreparedScript, execute_sql_scripts, prepare_scripts, scrub, validate_scripts
 
 
-def run(config: Config, log_dir: Path, *, headed: bool = False) -> dict[str, Any]:
+def write_diagnostic(path: Path, data: dict[str, Any], output: dict[str, Any]) -> None:
+    try:
+        path.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    except OSError:
+        # Auxiliary diagnostics must not prevent cleanup or erase its result.
+        output['diagnostic_write_failed'] = True
+
+
+def run(config: Config, log_dir: Path, *, headed: bool = False, scripts: list[PreparedScript] | None = None) -> dict[str, Any]:
     adapter: LCSAutomation | None = None
     credentials: Credentials | None = None
     output: dict[str, Any] = {}
@@ -32,7 +40,7 @@ def run(config: Config, log_dir: Path, *, headed: bool = False) -> dict[str, Any
             step = 'jit_request'
             credentials = adapter.request_access()
             step = 'sql_connection'
-            execution = execute_sql_scripts(credentials, config)
+            execution = execute_sql_scripts(credentials, config, scripts)
             output = {
                 'status': 'failure' if execution['scripts_failed'] else 'success',
                 'jit_request': {
@@ -51,7 +59,6 @@ def run(config: Config, log_dir: Path, *, headed: bool = False) -> dict[str, Any
             diagnostic = {'exception_type': type(error).__name__, 'frames': [
                 {'file': Path(frame.filename).name, 'line': frame.lineno, 'function': frame.name}
                 for frame in traceback.extract_tb(error.__traceback__) if Path(frame.filename).name in {'main.py', 'lcs_jit_automation.py', 'sql_executor.py', 'automation_support.py'}]}
-            (log_dir / 'diagnostic.json').write_text(json.dumps(diagnostic, indent=2), encoding='utf-8')
             if isinstance(error, AutomationError):
                 step, message = error.step, error.message
             else:
@@ -59,6 +66,7 @@ def run(config: Config, log_dir: Path, *, headed: bool = False) -> dict[str, Any
                 message = 'Automation failed. Check installed browser/ODBC dependencies, authentication, configured selectors, and network connectivity; raw exception suppressed for security.'
             output = {'status': 'failure', 'failed_at_step': step, 'error_message': message,
                       'screenshot_path': adapter.screenshot('error') if adapter is not None else None, 'exit_code': 1}
+            write_diagnostic(log_dir / 'diagnostic.json', diagnostic, output)
         finally:
             if adapter is not None:
                 try:
@@ -70,7 +78,7 @@ def run(config: Config, log_dir: Path, *, headed: bool = False) -> dict[str, Any
                 except Exception as cleanup_error:
                     cleanup_detail = {'exception_type': type(cleanup_error).__name__}
                     if log_dir is not None:
-                        (log_dir / 'cleanup_diagnostic.json').write_text(json.dumps(cleanup_detail, indent=2), encoding='utf-8')
+                        write_diagnostic(log_dir / 'cleanup_diagnostic.json', cleanup_detail, output)
                     if isinstance(cleanup_error, AutomationError):
                         message = cleanup_error.message + ' Remove the automation-owned source IP rule manually if present; SQL credentials may remain valid until expiry.'
                     else:
@@ -158,12 +166,12 @@ def main(argv: list[str] | None = None) -> int:
                     adapter.close()
             output = {'status': 'success', 'authentication_state': 'saved_encrypted'}
         else:
-            validate_scripts(config.scripts_path) # Read and parse before any access changes.
+            scripts = prepare_scripts(config.scripts_path) # Freeze exact batches before access changes.
             check_runtime(config)
             log_dir = config.logs_path / utcnow().strftime('%Y-%m-%d_%H-%M-%S_%f')
             log_dir.mkdir(parents=True, exist_ok=False)
             with environment_lock(config):
-                output = run(config, log_dir, headed=args.headed)
+                output = run(config, log_dir, headed=args.headed, scripts=scripts)
     except Exception as error:
         output = {'status': 'failure', 'failed_at_step': error.step if isinstance(error, AutomationError) else 'configuration',
                   'error_message': error.message if isinstance(error, AutomationError) else 'Startup failed. Verify local dependencies, configuration, and file permissions; raw error suppressed.',

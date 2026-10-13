@@ -65,7 +65,7 @@ def cipher(key_path: Path | None = None, *, create: bool = False) -> Fernet:
 def save_auth(context: BrowserContext, path: Path, key_path: Path | None = None) -> None:
     encrypted = cipher(key_path, create=True).encrypt(json.dumps(context.storage_state(indexed_db=True)).encode('utf-8'))
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.tmp')
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
         # Ciphertext only; exclusive open prevents following an existing temporary symlink.
         with temporary.open('xb') as handle:
@@ -73,7 +73,12 @@ def save_auth(context: BrowserContext, path: Path, key_path: Path | None = None)
             handle.write(encrypted)
         temporary.replace(path)
     except OSError:
-        raise AutomationError('authentication', 'Cannot save encrypted auth state. Check path permissions and stale .tmp files.') from None
+        raise AutomationError('authentication', 'Cannot save encrypted auth state. Check path permissions and disk space.') from None
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            raise AutomationError('authentication', 'Cannot remove temporary encrypted auth file. Check directory permissions.') from None
 
 
 def load_auth(path: Path, key_path: Path | None = None) -> StorageState:
@@ -213,6 +218,10 @@ class LCSAutomation:
             except AutomationError:
                 raise
             except BrowserError:
+                from urllib.parse import urlsplit
+                origin = urlsplit(self.page.url).hostname
+                if origin in {'login.microsoftonline.com', 'login.live.com'}:
+                    raise AutomationError('authentication', 'Saved login requires sign-in/MFA. Run ./run.ps1 -ForceInteractive.') from None
                 if self.page.url.startswith(LCS_URL + '/') and self.page.get_by_role('button', name='Maintain', exact=True).count():
                     raise AutomationError('environment', f'Environment not found in project {self.config.project_id}; check ENVIRONMENT_ID and environment_link selector.') from None
                 if attempt < 2:
@@ -244,6 +253,7 @@ class LCSAutomation:
 
     def enable_ip(self, public_ip: str) -> None:
         self.step = 'ip_rule'
+        self.verify_environment()
         self.public_ip = public_ip
         self.firewall_expires_at = utcnow() + timedelta(hours=8)
         if self.config.selectors.get('rule_grid'):
@@ -474,6 +484,7 @@ class LCSAutomation:
 
     def request_access(self) -> Credentials:
         self.step = 'jit_request'
+        self.verify_environment()
         self.wait_idle()
         accounts = self.locator('accounts')
         old_rows: set[tuple[str, str, str, str]] = set()

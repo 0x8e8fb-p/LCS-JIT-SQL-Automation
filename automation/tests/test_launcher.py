@@ -20,13 +20,20 @@ def invoke(script, *args, cwd=ROOT, env=None):
                           cwd=cwd, env=env, capture_output=True, text=True, timeout=45)
 
 
-def test_real_launcher_default_config_from_another_directory(tmp_path):
-    # Auto-detect the available Microsoft driver; no access changes.
+def test_real_launcher_config_from_another_directory(tmp_path):
+    # Independent of the user's personal config; no access changes.
     if os.name != 'nt':
         pytest.skip('The supplied Windows DPAPI profile targets Windows')
-    result = invoke(ROOT / 'run.ps1', '-ValidateOnly', cwd=tmp_path)
+    from test_config import profile
+    import yaml
+    config = profile(tmp_path)
+    data = yaml.safe_load(config.read_text())
+    data['SQL_SCRIPTS_PATH'] = str(ROOT / 'sql_scripts')
+    data['selectors'] = yaml.safe_load((ROOT / 'automation/defaults.yaml').read_text())['selectors']
+    config.write_text(yaml.safe_dump(data))
+    result = invoke(ROOT / 'run.ps1', '-ValidateOnly', '-Config', str(config), cwd=tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert str(ROOT / 'config.yaml') in result.stdout
+    assert str(config) in result.stdout
     assert '"runtime_checked": true' in result.stdout
     assert '"total_scripts": 2' in result.stdout
 
@@ -61,7 +68,8 @@ from pathlib import Path
 command = sys.argv[1]
 with Path(__file__).with_name('calls.txt').open('a') as f:
     f.write(command + '\\n')
-step = os.environ.get('TEST_AUTH_STEP', '')    failed = (command == 'check-auth' and bool(step)) or command == os.environ.get('TEST_FAIL_COMMAND')
+step = os.environ.get('TEST_AUTH_STEP', '')
+failed = (command == 'check-auth' and bool(step)) or command == os.environ.get('TEST_FAIL_COMMAND')
 print(json.dumps({'status': 'failure' if failed else 'success', 'failed_at_step': step}))
 sys.exit(1 if failed else 0)
 ''')
@@ -100,10 +108,17 @@ sys.exit(7 if failed else (1 if needs_login else 0))
 @pytest.mark.skipif(os.name != 'nt', reason='Windows batch compatibility wrapper')
 def test_batch_wrapper_from_another_directory(tmp_path):
     # Regression: SHIFT empties %0 after parsing, so resolve run.ps1 before SHIFT.
-    result = subprocess.run(['cmd.exe', '/d', '/c', str(ROOT / 'automation' / 'run.cmd'), '--validate-only'],
+    from test_config import profile
+    import yaml
+    config = profile(tmp_path)
+    data = yaml.safe_load(config.read_text())
+    data['SQL_SCRIPTS_PATH'] = str(ROOT / 'sql_scripts')
+    data['selectors'] = yaml.safe_load((ROOT / 'automation/defaults.yaml').read_text())['selectors']
+    config.write_text(yaml.safe_dump(data))
+    result = subprocess.run(['cmd.exe', '/d', '/c', str(ROOT / 'automation' / 'run.cmd'), '--validate-only', '--config', str(config)],
                             cwd=tmp_path, capture_output=True, text=True, timeout=45)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert str(ROOT / 'config.yaml') in result.stdout
+    assert str(config) in result.stdout
     result = subprocess.run(['cmd.exe', '/d', '/c', str(ROOT / 'automation' / 'run.cmd'), '--unknown'],
                             cwd=tmp_path, capture_output=True, text=True, timeout=10)
     assert result.returncode == 1
