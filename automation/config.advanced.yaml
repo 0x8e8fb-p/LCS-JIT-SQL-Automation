@@ -1,0 +1,47 @@
+# Optional advanced/reference profile. Normal users edit ../config.yaml only.
+# Relative paths in this file resolve from automation/.
+LCS_PROJECT_ID: "1830984"
+ENVIRONMENT_ID: "d365fosndbx"
+ENVIRONMENT_URL: "https://lcs.dynamics.com/V2/EnvironmentDetailsV3New/1830984?EnvironmentId=73caba6b-57a6-4c49-9cd8-545232a4d7dd&IsCloudEnvironment=true&IsDiagnosticsEnabledEnvironment=false"
+ACCESS_LEVEL: "read_write"
+ACCESS_REASON: "Performance tuning for AX (write to AX)"
+ACCESS_DETAILS: "test access"
+SQL_SCRIPTS_PATH: "../sql_scripts"
+CONTINUE_ON_ERROR: false
+DISABLE_ACCESS_AFTER: true # Delete only a uniquely named rule created by this run.
+STORAGE_STATE_PATH: "./.auth/d365fosndbx_auth.enc"
+AUTH_KEY_PATH: "./.auth/d365fosndbx_key.dpapi" # Encrypted by Windows DPAPI, same user only.
+BROWSER_TIMEZONE: "UTC"
+LOGS_PATH: "./logs"
+PUBLIC_IP: ""
+SQL_DNS_SUFFIX: "database.windows.net"
+# Driver 17 is installed on this host; TLS and certificate validation remain required.
+SQL_ODBC_DRIVER: "ODBC Driver 17 for SQL Server"
+SQL_TIMEOUT_SECONDS: 60
+MAX_RESULT_ROWS: 100
+selectors:
+  environment_link: ""
+  maintain: "button[id$='_MaintainEnvironment_button']"
+  enable_access: "#NetworkSecurityGroupModify"
+  enable_dialog: "[role='dialog']:has([id$='_NetworkSecurityRuleList'])"
+  accounts: "[id$='_ManageEnvironmentSection']"
+  reason: "#JITOptionDropdownCustomerView_input"
+  reason_list: "#JITOptionDropdownCustomerView_list"
+  details: "#JITInput_input"
+  request_access: "#JITRequestAccessButtonCustomerView"
+  rows: "[id$='_SqlAccountTable'] .rowTemplate:not(.place-holder):visible"
+  server_database: "input[name='ServerDbName']"
+  username: "input[name='SqlUserName']"
+  password: "[data-colindex='4'] input[name='SqlPasswordText']"
+  password_reveal: "[id='ToggleVisibilityIcon']"
+  expires_at: "[data-colindex='5'] input[name='ReasonForAccess']"
+  expiry_format: "lcs_utc"
+  row_reason: "[data-colindex='6'] input[name='ReasonForAccessDetails']"
+  row_details: "[data-colindex='7'] input[name='SqlPasswordText']"
+  rule_name: "test" # Exact user-requested name; never overwrite existing rules.
+  rule_grid: "[id$='_NetworkSecurityRuleList']"
+  rule_add: "button[id$='_AddRule']"
+  rule_delete: "button[id$='_DeleteRules']"
+  rule_close: "button[id$='_CloseButton']"
+  rule_add_dialog: "[role='dialog']:has(input[name='IpOrCidrField'])"
+  rule_confirm: "button[id$='_CreateTopBtn']"

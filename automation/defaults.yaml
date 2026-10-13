@@ -1,0 +1,33 @@
+# Internal LCS-managed sandbox adapter defaults. No account or environment secrets.
+SQL_SCRIPTS_PATH: "./sql_scripts"
+CONTINUE_ON_ERROR: false
+DISABLE_ACCESS_AFTER: true
+BROWSER_TIMEZONE: "UTC"
+PUBLIC_IP: ""
+SQL_DNS_SUFFIX: "database.windows.net"
+SQL_TIMEOUT_SECONDS: 60
+MAX_RESULT_ROWS: 100
+selectors:
+  maintain: "button[id$='_MaintainEnvironment_button']"
+  enable_access: "#NetworkSecurityGroupModify"
+  enable_dialog: "[role='dialog']:has([id$='_NetworkSecurityRuleList'])"
+  accounts: "[id$='_ManageEnvironmentSection']"
+  reason: "#JITOptionDropdownCustomerView_input"
+  reason_list: "#JITOptionDropdownCustomerView_list"
+  details: "#JITInput_input"
+  request_access: "#JITRequestAccessButtonCustomerView"
+  rows: "[id$='_SqlAccountTable'] .rowTemplate:not(.place-holder):visible"
+  server_database: "input[name='ServerDbName']"
+  username: "input[name='SqlUserName']"
+  password: "[data-colindex='4'] input[name='SqlPasswordText']"
+  password_reveal: "[id='ToggleVisibilityIcon']"
+  expires_at: "[data-colindex='5'] input[name='ReasonForAccess']"
+  expiry_format: "lcs_utc"
+  row_reason: "[data-colindex='6'] input[name='ReasonForAccessDetails']"
+  row_details: "[data-colindex='7'] input[name='SqlPasswordText']"
+  rule_grid: "[id$='_NetworkSecurityRuleList']"
+  rule_add: "button[id$='_AddRule']"
+  rule_delete: "button[id$='_DeleteRules']"
+  rule_close: "button[id$='_CloseButton']"
+  rule_add_dialog: "[role='dialog']:has(input[name='IpOrCidrField'])"
+  rule_confirm: "button[id$='_CreateTopBtn']"
