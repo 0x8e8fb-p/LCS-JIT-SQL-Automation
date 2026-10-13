@@ -1,0 +1,4 @@
+-- Metadata visibility depends on granted database permissions.
+SELECT TOP (10) TABLE_SCHEMA, TABLE_NAME
+FROM INFORMATION_SCHEMA.TABLES
+ORDER BY TABLE_SCHEMA, TABLE_NAME;

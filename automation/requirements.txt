@@ -1,0 +1,4 @@
+playwright>=1.51,<2
+pyodbc>=5.2,<6
+PyYAML>=6.0,<7
+cryptography>=44,<48

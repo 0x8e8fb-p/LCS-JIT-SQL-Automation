@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.auth/
+lcs_auth*.json
+logs/
+.env
+*.key
+browsers/
+runtime/
+.venv.backup-*/
+.launcher.lock
