@@ -46,6 +46,8 @@ def test_setup_first_run_and_repeat_are_idempotent(tmp_path, fresh):
     app = tmp_path / 'app with spaces'
     app.mkdir()
     (app / 'requirements.txt').write_text('requirements')
+    for name in ('main.py', 'automation_support.py', 'lcs_jit_automation.py', 'sql_executor.py', 'defaults.yaml'):
+        (app / name).write_text('fixture')
     body = f'''
 $script:Ready = ${str(not fresh).lower()}
 $script:Packages = ${str(not fresh).lower()}
@@ -83,10 +85,10 @@ Write-Output ('backups=' + @(Get-ChildItem -LiteralPath $App -Directory -Filter 
     result = invoke(tmp_path, body)
     assert result.returncode == 0, result.stdout + result.stderr
     if fresh:
-        assert 'calls=find,python,venv,pip-install,pip-check,odbc,chromium' in result.stdout
+        assert 'calls=find,python,venv,pip-install,pip-check,odbc,chromium,pip-check' in result.stdout
         assert 'backups=1' in result.stdout
     else:
-        assert 'calls=\n' in result.stdout
+        assert 'calls=pip-check,pip-check\n' in result.stdout
         assert 'backups=0' in result.stdout
 
 

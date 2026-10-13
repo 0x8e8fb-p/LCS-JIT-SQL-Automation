@@ -1,4 +1,10 @@
-playwright>=1.51,<2
-pyodbc>=5.2,<6
-PyYAML>=6.0,<7
-cryptography>=44,<48
+# Tested Windows x64 runtime (Python 3.10-3.13); update and retest together.
+playwright==1.63.0
+pyodbc==5.3.0
+PyYAML==6.0.3
+cryptography==47.0.0
+pyee==13.0.1
+greenlet==3.5.6
+cffi==2.1.1
+pycparser==3.11
+typing_extensions==4.16.0
