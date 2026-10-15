@@ -154,12 +154,10 @@ Write-Output "found=$found"
     assert f'found={reg_python}' in result.stdout
 
 
-@pytest.mark.parametrize(('installer_failure', 'expected'), [
-    ('', 'steps=noop-modify,unpack'),
-    # Burn can also fail outright (for example 1603) instead of no-op'ing.
-    ('Installer failed (exit 1603). Log: python-install.log', 'steps=install-failed,unpack'),
-])
-def test_install_local_python_repairs_stale_wix_burn_registration(tmp_path, installer_failure, expected):
+def test_install_local_python_extracts_without_windows_installer_registration(tmp_path):
+    # A per-user Python registration that outlives the project folder breaks the next
+    # install (no-op Modify, then 1603 from pip.msi on uninstall), so the preferred
+    # path only extracts files and must never run the official installer.
     app = tmp_path / 'new_app'
     target_py = app / 'runtime' / 'python' / 'python.exe'
     result = invoke(tmp_path, f'''
@@ -177,8 +175,7 @@ function Test-SupportedPython {{
 }}
 function Invoke-SetupProcess {{
     param($Executable, $Arguments, [switch]$Elevate, $LogPath)
-    if ({ps_quote(installer_failure)}) {{ $script:Steps.Add('install-failed'); throw {ps_quote(installer_failure)} }}
-    $script:Steps.Add('noop-modify')
+    $script:Steps.Add('official-installer')
 }}
 function Unpack-PythonInstaller {{
     param($Installer, $Target, $Cache)
@@ -191,7 +188,45 @@ if ($py -ne {ps_quote(target_py)}) {{ throw "Unexpected python: $py" }}
 Write-Output ('steps=' + ($script:Steps -join ','))
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
-    assert expected in result.stdout
+    assert 'steps=unpack' in result.stdout
+
+
+def test_install_local_python_falls_back_to_official_installer_when_extraction_fails(tmp_path):
+    # Blocked MSI administrative installation falls back to the registered per-user
+    # installer instead of failing the run.
+    app = tmp_path / 'new_app'
+    target_py = app / 'runtime' / 'python' / 'python.exe'
+    result = invoke(tmp_path, f'''
+$script:Steps = New-Object 'System.Collections.Generic.List[string]'
+function Get-VerifiedInstaller {{
+    param($Url, $Destination, $Publisher, $Sha256)
+    New-Item -ItemType Directory -Force -Path (Split-Path $Destination) | Out-Null
+    Set-Content -LiteralPath $Destination -Value 'fake-installer'
+    return $Destination
+}}
+function Find-SupportedPython {{ param($AppDir) return $null }}
+function Test-SupportedPython {{
+    param($Executable, $Prefix)
+    return ($Executable -eq {ps_quote(target_py)} -and (Test-Path -LiteralPath $Executable))
+}}
+function Invoke-SetupProcess {{
+    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
+    $script:Steps.Add('official-installer')
+    New-Item -ItemType Directory -Force -Path (Split-Path {ps_quote(target_py)}) | Out-Null
+    Set-Content -LiteralPath {ps_quote(target_py)} -Value 'registered-python'
+}}
+function Unpack-PythonInstaller {{
+    param($Installer, $Target, $Cache)
+    $script:Steps.Add('unpack')
+    throw 'MSI administrative installation is blocked by policy.'
+}}
+$py = Install-LocalPython -AppDir {ps_quote(app)}
+if ($py -ne {ps_quote(target_py)}) {{ throw "Unexpected python: $py" }}
+Write-Output ('steps=' + ($script:Steps -join ','))
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'steps=unpack,official-installer' in result.stdout
+    assert 'Local extraction failed: MSI administrative installation is blocked by policy.' in result.stdout
 
 
 def test_install_local_python_restart_requirement_stops_instead_of_extracting(tmp_path):
@@ -223,8 +258,10 @@ Write-Output ('steps=' + ($script:Steps -join ','))
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'requires a restart' in result.stdout
-    # Nothing was extracted: the restart instruction still stops the run.
-    assert 'steps=\n' in result.stdout
+    # Extraction produced no interpreter, so the run still stops instead of
+    # continuing with the unrelated discovery fallback.
+    assert 'steps=unpack' in result.stdout
+    assert 'find' not in result.stdout
 
 
 def test_unpack_python_installer_extracts_attached_msi_container(tmp_path):
@@ -250,7 +287,7 @@ function Invoke-FakeExpand {{
     param($Cab, $Flag, $WorkDir)
     if ((Get-Item -LiteralPath $Cab).Length -ne 10000032) {{ throw 'Unexpected CAB length' }}
     $Id = $Flag -replace '^-F:', ''
-    Set-Content -LiteralPath (Join-Path $WorkDir $Id) -Value "msi-$Id"
+    [IO.File]::WriteAllBytes((Join-Path $WorkDir $Id), [byte[]](0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1,0x00,0x00))
     $global:LASTEXITCODE = 0
 }}
 function Invoke-SetupProcess {{
@@ -265,4 +302,48 @@ Write-Output ('msis=' + ($script:Msis -join ','))
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
     assert 'msis=core.msi,exe.msi,dev.msi,lib.msi' in result.stdout
+
+
+def test_unpack_python_installer_rejects_unexpected_container_payload(tmp_path):
+    # Payload ids come from the verified 3.13.16 amd64 layout; a layout change must
+    # fail loudly instead of feeding a wrong file to msiexec.
+    import struct
+    installer = tmp_path / 'fake-python.exe'
+    cab_bytes = bytearray(10_000_064)
+    cab_bytes[0:8] = b'MSCF\x00\x00\x00\x00'
+    struct.pack_into('<I', cab_bytes, 8, 10_000_032)
+    cab_bytes[24] = 3
+    cab_bytes[25] = 1
+    installer.write_bytes(b'MZ' + b'\x00' * 126 + bytes(cab_bytes))
+    target_dir = tmp_path / 'target'
+    cache_dir = tmp_path / 'cache'
+    cache_dir.mkdir()
+    result = invoke(tmp_path, f'''
+$script:MsiExecCalled = $false
+$FakeBin = Join-Path {ps_quote(tmp_path)} 'fake-sys/System32'
+New-Item -ItemType Directory -Force -Path $FakeBin | Out-Null
+Set-Content -LiteralPath (Join-Path $FakeBin 'expand.exe') -Value ''
+$env:SystemRoot = Join-Path {ps_quote(tmp_path)} 'fake-sys'
+Set-Alias -Name (Join-Path $FakeBin 'expand.exe') -Value Invoke-FakeExpand
+function Invoke-FakeExpand {{
+    param($Cab, $Flag, $WorkDir)
+    Set-Content -LiteralPath (Join-Path $WorkDir ($Flag -replace '^-F:', '')) -Value 'not-an-msi'
+    $global:LASTEXITCODE = 0
+}}
+function Invoke-SetupProcess {{
+    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
+    $script:MsiExecCalled = $true
+}}
+try {{ Unpack-PythonInstaller -Installer {ps_quote(installer)} -Target {ps_quote(target_dir)} -Cache {ps_quote(cache_dir)}; throw 'Unexpected payload accepted' }}
+catch {{
+    if ($_.Exception.Message -eq 'Unexpected payload accepted') {{ throw }}
+    Write-Output $_.Exception.Message
+}}
+if ($script:MsiExecCalled) {{ throw 'msiexec ran for an unexpected payload' }}
+if (Test-Path -LiteralPath (Join-Path {ps_quote(cache_dir)} 'python-unpack')) {{ throw 'WorkDir not cleaned up' }}
+Write-Output 'rejected'
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'no longer matches the verified payload layout' in result.stdout
+    assert 'rejected' in result.stdout
 

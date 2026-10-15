@@ -159,10 +159,10 @@ The compatibility batch wrapper is at `automation/run.cmd`. For example, `automa
 
 The launcher:
 
-1. Finds an x64 Python 3.10–3.13 interpreter. If none is available, it downloads Python 3.13.16, verifies its checksum and publisher signature, and installs it under `automation/runtime/python/` without changing PATH. If a previously installed local Python folder was deleted or moved, the launcher extracts the interpreter from that verified download instead of failing on the stale installer registration; nothing is added to PATH and no system-wide Python is changed.
+1. Finds an x64 Python 3.10–3.13 interpreter. If none is available, it downloads Python 3.13.16, verifies its checksum and publisher signature, and installs it under `automation/runtime/python/`. Nothing is added to PATH and no system-wide Python is changed: the launcher extracts the interpreter from the verified download, which creates no Windows Installer product, no *Installed apps* entry and no `PythonCore` registry entry, so deleting or moving the project folder cannot leave a stale Python registration behind. Only if MSI extraction is blocked by policy does it fall back to the official installer, which registers a per-user `Python 3.13.16 (64-bit)` entry that should be removed before the project folder is deleted or moved.
 2. Creates an isolated environment at `automation/.venv/`. An unusable copied environment is preserved as a `.venv.backup-*` before rebuilding.
 3. Installs the pinned dependencies from binary wheels. On repeat runs it checks installed versions and imports, and runs `pip check` to detect compatibility problems.
-4. Uses Microsoft ODBC Driver 18 or 17, preferring 18 when both are installed. If neither is available, it downloads and verifies the Microsoft Driver 18.7 installer and requests elevation when needed. This driver release does not require a separately installed Visual C++ Redistributable.
+4. Uses Microsoft ODBC Driver 18 or 17, preferring 18 when both are installed. If neither is available, it downloads the current Microsoft ODBC Driver 18 (x64) MSI (18.7 at the time of writing) from Microsoft's stable download link, verifies its publisher signature, and requests elevation when needed. Driver 18 does not require a separately installed Visual C++ Redistributable.
 5. Installs Playwright Chromium under `automation/browsers/` and checks that it can launch.
 6. Validates the inputs before making LCS access changes.
 
@@ -231,6 +231,7 @@ Use an approved host and account. Shared egress IPs can affect other database se
 | Invalid configuration | Check the URL, exact reason label, non-empty details, rule-name format, duplicate keys, and stale environment overrides. |
 | Another launcher is active | Wait for the current run to finish. Do not delete lock files or launch overlapping grants. |
 | Saved authentication is missing or expired | Run `./run.ps1 -ForceInteractive` to sign in again and continue, or `-LaunchOnly` to refresh login without granting access. Use the same Windows identity for scheduled runs. |
+| Python installation stops on a no-op install, or fails with 1603 | An earlier fallback install registered a per-user Python for a folder that has since been deleted or moved. Remove the leftover **Python 3.13.16 (64-bit)** entry in *Settings → Apps → Installed apps*, then rerun. The normal setup path extracts the interpreter and registers nothing. |
 | LCS controls or credential rows cannot be found | Confirm this is an LCS-managed sandbox and that your account has permission. A changed UI may require adapter calibration. Do not share credentials or raw page dumps for debugging. |
 | `failed_at_step` is `sql_connection` | Check DNS, outbound ports, VPN/proxy routing, source egress IP, TLS, and the active JIT/firewall window. Database movement can change the SQL hostname. |
 | `failed_at_step` is `script_execution` | Review the script's sanitized result, granted permissions, supported T-SQL, timeout, and expiry. Earlier successful scripts may already be committed; do not blindly replay them. |
@@ -265,6 +266,7 @@ automation/
   lcs_jit_automation.py        # LCS browser adapter and encrypted login storage
   sql_executor.py             # SQL batching and transactional execution
   requirements.txt            # Pinned runtime dependencies
+  run.cmd                     # Compatibility batch wrapper for run.ps1
   tests/                      # Regression tests
   LIVE_TEST_RESULTS.md        # Dated verification evidence and limitations
 ```
@@ -273,7 +275,7 @@ Generated runtime, browser, authentication, and log files stay under `automation
 
 ## Verification and development
 
-The latest recorded audit ran the visible and headless launchers against one LCS sandbox. Both runs executed the two SELECT samples successfully, and separate browser inspections confirmed that no firewall rules remained. The final regression suite had **88 passing tests**, with clean runtime typechecking. A later setup-robustness change that recovers from a deleted/moved local Python folder was verified separately; the suite then had **98 passing tests**. See [the verification record](automation/LIVE_TEST_RESULTS.md) for dates, measurements, and scope.
+The latest recorded audit ran the visible and headless launchers against one LCS sandbox. Both runs executed the two SELECT samples successfully, and separate browser inspections confirmed that no firewall rules remained. The final regression suite had **88 passing tests**, with clean runtime typechecking. A later setup-robustness change that recovers from a deleted/moved local Python folder was verified separately; the suite then had **98 passing tests**. The Python install path was then made registration-free — the launcher extracts the verified interpreter instead of registering a per-user Python, and a real extraction was re-verified on Windows x64 with **99 passing tests**. See [the verification record](automation/LIVE_TEST_RESULTS.md) for dates, measurements, and scope.
 
 A source-only download copy passed prerequisite setup and repeat validation. Actual missing-driver installation and UAC on a pristine Windows machine were not verified because the test host already had Driver 17. These results do not certify other tenants, arbitrary write scripts, or every supported Windows/Python combination. See [the verification record](automation/LIVE_TEST_RESULTS.md) for dates, measurements, and scope.
 

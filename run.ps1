@@ -43,7 +43,10 @@ try {
     if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
         $DefaultConfig = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'config.yaml'))
         $Template = Join-Path $AppDir 'config.template.yaml'
-        if ($Config -eq $DefaultConfig -and -not (Test-Path -LiteralPath $Config) -and (Test-Path -LiteralPath $Template -PathType Leaf)) {
+        if ($Config -eq $DefaultConfig -and -not (Test-Path -LiteralPath $Config)) {
+            if (-not (Test-Path -LiteralPath $Template -PathType Leaf)) {
+                throw 'Incomplete download: automation/config.template.yaml is missing. Extract the whole project before running.'
+            }
             # Exclusive creation: never overwrite another user's configuration.
             $Content = [IO.File]::ReadAllBytes($Template)
             $NewConfig = [IO.File]::Open($Config, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
