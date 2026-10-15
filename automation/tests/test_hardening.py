@@ -149,3 +149,63 @@ def test_stale_encrypted_auth_temp_does_not_block_refresh(tmp_path, monkeypatch)
     assert lcs.load_auth(path) == {'cookies': [], 'origins': []}
     assert stale.read_bytes() == b'old encrypted state'
     assert list(tmp_path.glob('auth.enc.*.tmp')) == []
+
+
+@pytest.mark.parametrize('host', ['eu.lcs.dynamics.com', 'fr.lcs.dynamics.com', 'sa.lcs.dynamics.com'])
+def test_regional_lcs_hosts_are_supported(tmp_path, host):
+    regional_url = URL.replace('lcs.dynamics.com', host)
+    c = Config.load(profile(tmp_path, ENVIRONMENT_URL=regional_url))
+    assert c.lcs_origin == f'https://{host}'
+    assert c.project_id == '123456'
+
+
+def test_bootstrap_recovers_from_logon_index_and_saves_session(tmp_path, monkeypatch):
+    from playwright.sync_api import sync_playwright
+    monkeypatch.setenv('LCS_AUTH_KEY', Fernet.generate_key().decode())
+    monkeypatch.setattr('builtins.input', lambda: '')
+    c = Config.load(profile(tmp_path))
+    c.state_path = tmp_path / 'auth.enc'
+    c.auth_key_path = None
+    with sync_playwright() as p:
+        adapter = lcs.LCSAutomation(c, p, tmp_path / 'logs', bootstrap=True)
+        def route(r):
+            if '/Logon/Index' in r.request.url:
+                r.fulfill(content_type='text/html', body='<a class="loginLink" href="/V2/Project/123456">Sign in</a>')
+            else:
+                r.fulfill(content_type='text/html', body='<h1>contoso-sandbox</h1><section id="x_ManageEnvironmentSection">Database Accounts</section>')
+        adapter.context.route('https://lcs.dynamics.com/**', route)
+        try:
+            adapter.page.goto('https://lcs.dynamics.com/Logon/Index')
+            adapter.bootstrap(navigate_first=False)
+            assert c.state_path.exists()
+            assert c.environment_id == 'contoso-sandbox'
+        finally:
+            adapter.close()
+
+
+def test_persistent_profile_and_navigate_refresh_saved_auth(tmp_path, monkeypatch):
+    from playwright.sync_api import sync_playwright
+    monkeypatch.setenv('LCS_AUTH_KEY', Fernet.generate_key().decode())
+    c = Config.load(profile(tmp_path))
+    c.state_path = tmp_path / 'auth.enc'
+    c.auth_key_path = tmp_path / 'auth.dpapi'
+    c.state_path.write_bytes(lcs.cipher(c.auth_key_path, create=True).encrypt(json.dumps({
+        'cookies': [{'name': 'lcscs', 'value': 'session123', 'domain': '.lcs.dynamics.com', 'path': '/', 'expires': -1, 'httpOnly': True, 'secure': True, 'sameSite': 'Lax'}],
+        'origins': [],
+    }).encode()))
+    with sync_playwright() as p:
+        adapter = lcs.LCSAutomation(c, p, tmp_path / 'logs')
+        adapter.context.route('https://lcs.dynamics.com/**', lambda r: r.fulfill(
+            content_type='text/html',
+            headers={'Set-Cookie': 'lcsada=updated456; Path=/; Secure; HttpOnly'},
+            body='<h1>contoso-sandbox</h1><section id="x_ManageEnvironmentSection">Database Accounts</section>',
+        ))
+        try:
+            assert (tmp_path / 'auth.profile').is_dir()
+            adapter.navigate()
+            saved = lcs.load_auth(c.state_path, c.auth_key_path)
+            names = {cookie['name']: cookie['value'] for cookie in saved['cookies']}
+            assert names.get('lcscs') == 'session123'
+            assert names.get('lcsada') == 'updated456'
+        finally:
+            adapter.close()

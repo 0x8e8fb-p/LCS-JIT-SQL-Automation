@@ -12,7 +12,7 @@ from typing import Any
 
 from playwright.sync_api import sync_playwright
 
-from automation_support import AutomationError, Config, Credentials, environment_lock, timestamp, utcnow
+from automation_support import AutomationError, Config, Credentials, LCS_HOSTS, environment_lock, timestamp, utcnow
 from lcs_jit_automation import LCSAutomation, get_public_ip, save_auth
 from sql_executor import PreparedScript, execute_sql_scripts, prepare_scripts, scrub, validate_scripts
 
@@ -25,7 +25,7 @@ def write_diagnostic(path: Path, data: dict[str, Any], output: dict[str, Any]) -
         output['diagnostic_write_failed'] = True
 
 
-def run(config: Config, log_dir: Path, *, headed: bool = False, scripts: list[PreparedScript] | None = None) -> dict[str, Any]:
+def run(config: Config, log_dir: Path, *, headed: bool = False, interactive_auth: bool = False, scripts: list[PreparedScript] | None = None) -> dict[str, Any]:
     adapter: LCSAutomation | None = None
     credentials: Credentials | None = None
     output: dict[str, Any] = {}
@@ -33,8 +33,12 @@ def run(config: Config, log_dir: Path, *, headed: bool = False, scripts: list[Pr
     started = time.monotonic()
     with sync_playwright() as playwright:
         try:
-            adapter = LCSAutomation(config, playwright, log_dir, headed=headed)
-            adapter.navigate()
+            adapter = LCSAutomation(config, playwright, log_dir, bootstrap=interactive_auth, headed=headed or interactive_auth)
+            if interactive_auth:
+                adapter.bootstrap()
+                adapter.screenshot('01_login')
+            else:
+                adapter.navigate(allow_interactive_auth=headed)
             step = 'ip_rule'
             adapter.enable_ip(get_public_ip(config))
             step = 'jit_request'
@@ -116,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--config', type=Path, default=Path(__file__).resolve().parent.parent / 'config.yaml')
     parser.add_argument('--cdp-url', default='http://127.0.0.1:9222', help='Loopback-only Edge debugging URL for import-auth')
     parser.add_argument('--headed', action='store_true', help='Run the browser UI visibly instead of headless')
+    parser.add_argument('--interactive-auth', action='store_true', help='Authenticate interactively in the current run browser before continuing')
     parser.add_argument('--check-runtime', action='store_true', help='Also verify installed ODBC driver and Chromium during validate')
     args = parser.parse_args(argv)
     log_dir: Path | None = None
@@ -143,12 +148,12 @@ def main(argv: list[str] | None = None) -> int:
             with sync_playwright() as playwright:
                 browser = playwright.chromium.connect_over_cdp(args.cdp_url)
                 matches = [(context, page) for context in browser.contexts for page in context.pages
-                           if urlsplit(page.url).hostname == 'lcs.dynamics.com'
+                           if urlsplit(page.url).hostname in LCS_HOSTS
                            and urlsplit(page.url).path == f'/V2/EnvironmentDetailsV3New/{config.project_id}']
                 if config.environment_url:
                     from urllib.parse import parse_qs
                     matches = [(context, page) for context, page in matches
-                               if parse_qs(urlsplit(page.url).query).get('EnvironmentId') == [config.environment_key]]
+                               if [v.lower() for v in parse_qs(urlsplit(page.url).query).get('EnvironmentId', [])] == [config.environment_key.lower()]]
                 if len(matches) != 1:
                     raise AutomationError('authentication', 'Open exactly one matching LCS environment in the inspection browser.')
                 heading = matches[0][1].locator('h1')
@@ -171,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             log_dir = config.logs_path / utcnow().strftime('%Y-%m-%d_%H-%M-%S_%f')
             log_dir.mkdir(parents=True, exist_ok=False)
             with environment_lock(config):
-                output = run(config, log_dir, headed=args.headed, scripts=scripts)
+                output = run(config, log_dir, headed=args.headed, interactive_auth=args.interactive_auth, scripts=scripts)
     except Exception as error:
         output = {'status': 'failure', 'failed_at_step': error.step if isinstance(error, AutomationError) else 'configuration',
                   'error_message': error.message if isinstance(error, AutomationError) else 'Startup failed. Verify local dependencies, configuration, and file permissions; raw error suppressed.',
