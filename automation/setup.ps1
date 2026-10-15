@@ -86,6 +86,60 @@ function Invoke-SetupProcess {
     if ($Process.ExitCode -ne 0) { throw "Installer failed (exit $($Process.ExitCode)). Log: $LogPath" }
 }
 
+function Unpack-PythonInstaller {
+    param([string]$Installer, [string]$Target, [string]$Cache)
+    $Bytes = [IO.File]::ReadAllBytes($Installer)
+    $CabOffset = -1
+    $CabSize = 0
+    $Pos = 0
+    while ($Pos -le $Bytes.Length - 28) {
+        $Idx = [Array]::IndexOf($Bytes, [byte]0x4D, $Pos)
+        if ($Idx -lt 0 -or $Idx -gt $Bytes.Length - 28) { break }
+        if ($Bytes[$Idx + 1] -eq 0x53 -and $Bytes[$Idx + 2] -eq 0x43 -and $Bytes[$Idx + 3] -eq 0x46 -and
+            $Bytes[$Idx + 4] -eq 0x00 -and $Bytes[$Idx + 5] -eq 0x00 -and $Bytes[$Idx + 6] -eq 0x00 -and $Bytes[$Idx + 7] -eq 0x00 -and
+            $Bytes[$Idx + 24] -eq 3 -and $Bytes[$Idx + 25] -eq 1) {
+            $Size = [BitConverter]::ToInt32($Bytes, $Idx + 8)
+            if ($Size -gt 10000000 -and ($Idx + $Size) -le $Bytes.Length) {
+                $CabOffset = $Idx
+                $CabSize = $Size
+                break
+            }
+        }
+        $Pos = $Idx + 1
+    }
+    if ($CabOffset -lt 0) { throw "Could not locate attached MSI container in $Installer" }
+    $WorkDir = Join-Path $Cache 'python-unpack'
+    if (Test-Path -LiteralPath $WorkDir) { Remove-Item -LiteralPath $WorkDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+    try {
+        $CabPath = Join-Path $WorkDir 'attached.cab'
+        $Stream = [IO.File]::Open($CabPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $Stream.Write($Bytes, $CabOffset, $CabSize) } finally { $Stream.Dispose() }
+        $Expand = Join-Path $env:SystemRoot 'System32/expand.exe'
+        $MsiExec = Join-Path $env:SystemRoot 'System32/msiexec.exe'
+        $Payloads = @(
+            @{ Id = 'a0'; Name = 'core.msi' },
+            @{ Id = 'a2'; Name = 'exe.msi' },
+            @{ Id = 'a4'; Name = 'dev.msi' },
+            @{ Id = 'a6'; Name = 'lib.msi' }
+        )
+        foreach ($Payload in $Payloads) {
+            & $Expand $CabPath ("-F:{0}" -f $Payload.Id) $WorkDir *> $null
+            if ($LASTEXITCODE -ne 0) { throw "Failed to extract $($Payload.Name) from Python installer." }
+            $MsiPath = Join-Path $WorkDir $Payload.Name
+            Move-Item -LiteralPath (Join-Path $WorkDir $Payload.Id) -Destination $MsiPath -Force
+            $MsiLog = Join-Path $Cache ("python-admin-$($Payload.Name).log")
+            Invoke-SetupProcess -Executable $MsiExec -LogPath $MsiLog -Arguments @(
+                '/a', ('"{0}"' -f $MsiPath), '/qn', '/norestart',
+                ('TARGETDIR="{0}"' -f $Target), '/L*v', ('"{0}"' -f $MsiLog)
+            )
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-LocalPython {
     param([string]$AppDir)
     $Cache = Join-Path $AppDir 'runtime/installers'
@@ -102,20 +156,34 @@ function Install-LocalPython {
         'Include_test=0', 'Include_doc=0', 'Include_tcltk=0', 'AssociateFiles=0', 'Shortcuts=0',
         ('TargetDir="{0}"' -f $Target), '/log', ('"{0}"' -f $Log)
     )
-    Invoke-SetupProcess -Executable $Installer -LogPath $Log -Arguments $InstallArgs
+    $InstallError = $null
+    try {
+        Invoke-SetupProcess -Executable $Installer -LogPath $Log -Arguments $InstallArgs
+    }
+    catch {
+        # A required restart still stops the run; other installer failures may be a
+        # stale registration that the direct extraction below can recover from.
+        if ($_.Exception.Message -match 'requires a restart') { throw }
+        $InstallError = $_.Exception.Message
+    }
     $Python = Join-Path $Target 'python.exe'
     if (Test-SupportedPython $Python) { return $Python }
     $Found = Find-SupportedPython $AppDir
     if ($Found) { return $Found }
-    # If Python 3.13 was previously installed to a deleted/moved folder, WiX Burn
-    # treats a normal run as a no-op Modify. Uninstall the stale registration and
-    # perform a clean install into TargetDir.
+    # If Python 3.13 was previously installed to a folder that was deleted or moved,
+    # WiX Burn reports the payloads as present: a normal run or /layout is a no-op
+    # Modify, and /uninstall fails (for example 1603 from pip.msi) because python.exe
+    # is missing at the stale InstallDirectory. Extract the attached MSI container
+    # from the verified installer directly into TargetDir instead.
     Write-Host 'Repairing stale Python 3.13 installer registration...'
-    $UninstallLog = Join-Path $Cache 'python-uninstall.log'
-    Invoke-SetupProcess -Executable $Installer -LogPath $UninstallLog -Arguments @(
-        '/uninstall', '/quiet', '/norestart', '/log', ('"{0}"' -f $UninstallLog)
-    )
-    Invoke-SetupProcess -Executable $Installer -LogPath $Log -Arguments $InstallArgs
+    if ($InstallError) { Write-Host "Repairing after installer failure: $InstallError" }
+    try {
+        Unpack-PythonInstaller -Installer $Installer -Target $Target -Cache $Cache
+    }
+    catch {
+        if ($InstallError) { throw "$InstallError Local extraction also failed: $($_.Exception.Message)" }
+        throw
+    }
     if (Test-SupportedPython $Python) { return $Python }
     $Found = Find-SupportedPython $AppDir
     if ($Found) { return $Found }

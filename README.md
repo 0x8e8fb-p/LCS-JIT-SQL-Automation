@@ -159,7 +159,7 @@ The compatibility batch wrapper is at `automation/run.cmd`. For example, `automa
 
 The launcher:
 
-1. Finds an x64 Python 3.10–3.13 interpreter. If none is available, it downloads Python 3.13.16, verifies its checksum and publisher signature, and installs it under `automation/runtime/python/` without changing PATH.
+1. Finds an x64 Python 3.10–3.13 interpreter. If none is available, it downloads Python 3.13.16, verifies its checksum and publisher signature, and installs it under `automation/runtime/python/` without changing PATH. If a previously installed local Python folder was deleted or moved, the launcher extracts the interpreter from that verified download instead of failing on the stale installer registration; nothing is added to PATH and no system-wide Python is changed.
 2. Creates an isolated environment at `automation/.venv/`. An unusable copied environment is preserved as a `.venv.backup-*` before rebuilding.
 3. Installs the pinned dependencies from binary wheels. On repeat runs it checks installed versions and imports, and runs `pip check` to detect compatibility problems.
 4. Uses Microsoft ODBC Driver 18 or 17, preferring 18 when both are installed. If neither is available, it downloads and verifies the Microsoft Driver 18.7 installer and requests elevation when needed. This driver release does not require a separately installed Visual C++ Redistributable.
@@ -273,7 +273,7 @@ Generated runtime, browser, authentication, and log files stay under `automation
 
 ## Verification and development
 
-The latest recorded audit ran the visible and headless launchers against one LCS sandbox. Both runs executed the two SELECT samples successfully, and separate browser inspections confirmed that no firewall rules remained. The final regression suite had **88 passing tests**, with clean runtime typechecking.
+The latest recorded audit ran the visible and headless launchers against one LCS sandbox. Both runs executed the two SELECT samples successfully, and separate browser inspections confirmed that no firewall rules remained. The final regression suite had **88 passing tests**, with clean runtime typechecking. A later setup-robustness change that recovers from a deleted/moved local Python folder was verified separately; the suite then had **98 passing tests**. See [the verification record](automation/LIVE_TEST_RESULTS.md) for dates, measurements, and scope.
 
 A source-only download copy passed prerequisite setup and repeat validation. Actual missing-driver installation and UAC on a pristine Windows machine were not verified because the test host already had Driver 17. These results do not certify other tenants, arbitrary write scripts, or every supported Windows/Python combination. See [the verification record](automation/LIVE_TEST_RESULTS.md) for dates, measurements, and scope.
 

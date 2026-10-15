@@ -1,6 +1,18 @@
 # Setup verification and historical live results
 
-## Latest end-to-end audit — 2026-10-13
+## Stale local-Python repair verification — 2026-10-15
+
+**Reviewed failure:** on a host whose project-local Python 3.13 folder had been deleted or moved, `./run.ps1` stopped with installer exit **1603**. The logged cause (`python-uninstall.log`) is `Failed to uninstall MSI package` for `pip_JustForMe`: the WiX Burn registration still pointed at an InstallDirectory where `python.exe` no longer existed, so neither a reinstall (no-op Modify) nor the previous uninstall-then-reinstall repair could succeed.
+
+**Change:** `Install-LocalPython` no longer uninstalls the stale bundle. It extracts the attached MSI container from the already checksum- and publisher-verified `python-3.13.16-amd64.exe` with `expand.exe` and runs `msiexec /a` for the core, exe, dev and lib payloads directly into `automation/runtime/python/`. This is a per-user file extraction: no ARP entry, PATH entry, or system-wide Python is created, and the temporary extraction folder is deleted afterwards.
+
+**Verified on this host (2026-10-15):** real installer download with SHA-256 and Authenticode verification, with system-Python and registry discovery overridden to simulate the deleted previous folder. The repair path produced a usable **Python 3.13.16 x64** interpreter (OpenSSL 3.5.9, `ssl`, `sqlite3`, `ctypes`, `venv`, `ensurepip`, 64-bit pointers, development headers present) which created a virtual environment with **pip 26.2.1**; all pinned wheels installed with `--only-binary=:all:` and `pip check` reported **no broken requirements**. A repeat discovery returned the same `automation/runtime/python/python.exe`, confirming the repair is not repeated once the interpreter exists. An installer that fails outright (rather than no-op'ing) now falls back to the same extraction, while a required Windows restart still stops the run.
+
+- Unit tests cover the repair branch (no-op and failed installer variants), the restart behavior, and the container extraction (`test_install_local_python_repairs_stale_wix_burn_registration`, `test_install_local_python_restart_requirement_stops_instead_of_extracting`, `test_unpack_python_installer_extracts_attached_msi_container`).
+- Full regression suite: **98 passed** (no skips). Typechecking of the four runtime modules: clean. `./run.ps1 -ValidateOnly`: exit **0**.
+- **Limits:** the stale-registration condition was simulated by overriding discovery on this host; the host's own Python installations were not uninstalled, and the extraction path itself ran for real. The extracted interpreter is a per-user file copy: it has no `pip` module of its own (the launcher creates its own environment and uses that environment's bundled pip, which was verified) and no tcl/tk, documentation, or test suite. The stale Burn registration is intentionally left in place, so Windows can still list the earlier Python 3.13.16 entry in *Apps & features*. Non-admin MSI-administrative-install policy, a pristine VM, and live LCS/SQL execution were not part of this verification.
+
+## End-to-end audit — 2026-10-13
 
 **Current result: real SQL execution and owned-rule cleanup verified through the root launcher.** The earlier connectivity-only conclusion below is historical and is superseded by this audit.
 
