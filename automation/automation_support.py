@@ -111,6 +111,15 @@ def parse_server_database(value: str, suffix: str) -> tuple[str, str]:
     return server, database
 
 
+LCS_HOSTS = {
+    'lcs.dynamics.com',
+    'eu.lcs.dynamics.com',
+    'fr.lcs.dynamics.com',
+    'sa.lcs.dynamics.com',
+    'uae.lcs.dynamics.com',
+    'ch.lcs.dynamics.com',
+    'no.lcs.dynamics.com',
+}
 BOOL_KEYS = {'CONTINUE_ON_ERROR', 'DISABLE_ACCESS_AFTER'}
 ENV_KEYS = {
     'LCS_PROJECT_ID', 'ENVIRONMENT_ID', 'ACCESS_LEVEL', 'ACCESS_REASON',
@@ -144,6 +153,14 @@ class Config:
     auth_key_path: Path | None = None
 
     @property
+    def lcs_origin(self) -> str:
+        if self.environment_url:
+            target = urlsplit(self.environment_url)
+            if target.scheme == 'https' and target.netloc in LCS_HOSTS:
+                return f'{target.scheme}://{target.netloc}'
+        return 'https://lcs.dynamics.com'
+
+    @property
     def environment_key(self) -> str:
         return parse_qs(urlsplit(self.environment_url).query).get('EnvironmentId', [self.environment_id])[0]
 
@@ -172,9 +189,13 @@ class Config:
                 target = urlsplit(str(data['ENVIRONMENT_URL']))
                 match = re.fullmatch(r'/V2/EnvironmentDetailsV3New/(\d+)', target.path)
                 ids = parse_qs(target.query, keep_blank_values=True).get('EnvironmentId', [])
-                if target.scheme != 'https' or target.netloc != 'lcs.dynamics.com' or target.fragment or not match or len(ids) != 1:
+                if target.scheme != 'https' or target.netloc not in LCS_HOSTS or target.fragment or not match or len(ids) != 1:
                     raise ValueError('Paste a complete HTTPS LCS environment-details URL')
-                if str(uuid.UUID(ids[0])) != ids[0]:
+                try:
+                    canonical_id = str(uuid.UUID(ids[0])).lower()
+                except ValueError:
+                    raise ValueError('EnvironmentId must be a valid GUID') from None
+                if ids[0].lower() != canonical_id or ids[0] != canonical_id:
                     raise ValueError('EnvironmentId must be a canonical lowercase GUID')
                 derived_project = match.group(1)
                 if 'LCS_PROJECT_ID' in data and data['LCS_PROJECT_ID'] != derived_project:
@@ -281,7 +302,7 @@ class Config:
             environment_url = text('ENVIRONMENT_URL')
             if environment_url:
                 target = urlsplit(environment_url)
-                if target.scheme != 'https' or target.netloc != 'lcs.dynamics.com' or target.path != f'/V2/EnvironmentDetailsV3New/{project}' or not parse_qs(target.query).get('EnvironmentId'):
+                if target.scheme != 'https' or target.netloc not in LCS_HOSTS or target.path != f'/V2/EnvironmentDetailsV3New/{project}' or not parse_qs(target.query).get('EnvironmentId'):
                     raise ValueError('ENVIRONMENT_URL must target the configured LCS project')
             timezone = text('BROWSER_TIMEZONE', 'UTC')
             if timezone != 'UTC':

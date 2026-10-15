@@ -9,18 +9,19 @@ from datetime import timedelta, timezone
 import uuid
 import ctypes
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, Sequence, cast
 from datetime import datetime
-from playwright._impl._api_structures import StorageState
+from playwright._impl._api_structures import SetCookieParam, StorageState
 import sys
 from urllib.request import urlopen
 
 from cryptography.fernet import Fernet, InvalidToken
-from playwright.sync_api import BrowserContext, Locator, Page, Playwright, Error as BrowserError
+from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwright, Error as BrowserError
 
-from automation_support import AutomationError, Config, Credentials, parse_expiry, parse_server_database, timestamp, utcnow
+from automation_support import AutomationError, Config, Credentials, LCS_HOSTS, parse_expiry, parse_server_database, timestamp, utcnow
 
 LCS_URL = 'https://lcs.dynamics.com'
+LOGIN_HOSTS = {'login.microsoftonline.com', 'login.live.com', 'login.windows.net'}
 
 
 def protected_local_key(path: Path, *, create: bool = False) -> bytes:
@@ -109,15 +110,36 @@ class LCSAutomation:
     def __init__(self, config: Config, playwright: Playwright, log_dir: Path, *, bootstrap: bool = False, headed: bool = False):
         self.config = config
         self.log_dir = log_dir
-        self.browser = playwright.chromium.launch(headless=not (bootstrap or headed))
+        self.browser: Browser | None = None
+        headless = not (bootstrap or headed)
+        profile_dir = self._profile_dir()
         try:
-            state = None if bootstrap else load_auth(config.state_path, config.auth_key_path)
-            self.context = self.browser.new_context(storage_state=state, accept_downloads=False, timezone_id=config.browser_timezone)
+            state = None if bootstrap else self._initial_state(profile_dir)
+            if profile_dir is not None:
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                self.context = playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    headless=headless,
+                    accept_downloads=False,
+                    timezone_id=config.browser_timezone,
+                )
+                if state is not None and state.get('cookies'):
+                    try:
+                        self.context.add_cookies(cast(Sequence[SetCookieParam], state['cookies']))
+                    except Exception:
+                        pass
+                self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            else:
+                self.browser = playwright.chromium.launch(headless=headless)
+                self.context = self.browser.new_context(storage_state=state, accept_downloads=False, timezone_id=config.browser_timezone)
+                self.page = self.context.new_page()
             self.context.set_default_timeout(10000)
-            self.page = self.context.new_page()
-        except Exception:
-            self.browser.close()
+        except AutomationError:
+            self.close()
             raise
+        except Exception:
+            self.close()
+            raise AutomationError('authentication', 'Browser context could not be opened. Close any leftover Chromium processes and retry.') from None
         self.ip_rule_attempted = False
         self.public_ip = ''
         self.requested_at = utcnow()
@@ -126,8 +148,23 @@ class LCSAutomation:
         self.rule_name = ''
         self.rule_created = False
 
+    def _profile_dir(self) -> Path | None:
+        if self.config.auth_key_path is None:
+            return None
+        return self.config.state_path.with_name(f'{self.config.state_path.stem}.profile')
+
+    def _initial_state(self, profile_dir: Path | None) -> StorageState | None:
+        if self.config.state_path.exists() or profile_dir is None or not profile_dir.exists():
+            return load_auth(self.config.state_path, self.config.auth_key_path)
+        return None
+
     def close(self) -> None:
-        self.browser.close()
+        try:
+            if hasattr(self, 'context') and self.context is not None:
+                self.context.close()
+        finally:
+            if getattr(self, 'browser', None) is not None and self.browser is not None:
+                self.browser.close()
 
     def locator(self, key: str, *, scope: Page | Locator | None = None) -> Locator:
         root = self.page if scope is None else scope
@@ -153,6 +190,48 @@ class LCSAutomation:
             return root.get_by_label(labels[key], exact=True)
         raise AutomationError(self.step, 'Required selector is missing; calibrate config.yaml against your tenant DOM.')
 
+    def _active_lcs_page(self) -> Page:
+        from urllib.parse import urlsplit
+        expected_host = urlsplit(self.config.lcs_origin).netloc
+        for candidate in reversed(self.context.pages):
+            try:
+                parsed = urlsplit(candidate.url)
+                if parsed.scheme == 'https' and parsed.netloc == expected_host and parsed.path.startswith('/V2/'):
+                    return candidate
+            except Exception:
+                continue
+        for candidate in reversed(self.context.pages):
+            try:
+                parsed = urlsplit(candidate.url)
+                if parsed.scheme == 'https' and parsed.netloc in LCS_HOSTS:
+                    return candidate
+            except Exception:
+                continue
+        return self.page
+
+    def _complete_lcs_landing(self, target_url: str) -> None:
+        from urllib.parse import parse_qs, urlsplit
+        self.page = self._active_lcs_page()
+        parsed = urlsplit(self.page.url)
+        if parsed.netloc in LCS_HOSTS and parsed.path.lower().startswith('/logon/'):
+            sign_in = self.page.locator('a.loginLink')
+            if sign_in.count() == 1 and sign_in.is_visible():
+                try:
+                    with self.page.expect_navigation(wait_until='domcontentloaded', timeout=30000):
+                        sign_in.click()
+                except BrowserError:
+                    pass
+        self.page = self._active_lcs_page()
+        parsed = urlsplit(self.page.url)
+        expected = urlsplit(target_url)
+        same_target = (
+            parsed.path == expected.path
+            and [v.lower() for v in parse_qs(parsed.query).get('EnvironmentId', [])]
+            == [v.lower() for v in parse_qs(expected.query).get('EnvironmentId', [])]
+        )
+        if parsed.scheme == 'https' and parsed.netloc in LCS_HOSTS and not same_target:
+            self.page.goto(target_url, wait_until='domcontentloaded', timeout=30000)
+
     def screenshot(self, name: str) -> str | None:
         """Mask BEFORE encoding/writing. Fail closed if accounts container is unknown.
 
@@ -164,7 +243,7 @@ class LCSAutomation:
             path = self.log_dir / f'{name}.png'
             accounts_css = self.config.selectors.get('accounts', '')
             accounts = self.page.locator(accounts_css) if accounts_css else None
-            on_lcs = self.page.url.startswith(LCS_URL + '/')
+            on_lcs = self.page.url.startswith(self.config.lcs_origin + '/')
             if on_lcs and accounts is not None and accounts.count() == 1 and accounts.is_visible():
                 masks = [accounts, self.page.locator('input, textarea, iframe')]
             else:
@@ -180,10 +259,11 @@ class LCSAutomation:
         from urllib.parse import parse_qs, urlsplit
         target = urlsplit(self.page.url)
         expected = urlsplit(self.config.environment_url) if self.config.environment_url else None
-        if target.scheme != 'https' or target.netloc != 'lcs.dynamics.com':
+        expected_host = expected.netloc if expected is not None else urlsplit(self.config.lcs_origin).netloc
+        if target.scheme != 'https' or target.netloc != expected_host:
             raise AutomationError('authentication', 'Authentication expired or sign-in/MFA requires interaction. Run ./run.ps1 -ForceInteractive.')
         if expected is not None:
-            if target.path != expected.path or parse_qs(target.query).get('EnvironmentId') != parse_qs(expected.query).get('EnvironmentId'):
+            if target.path != expected.path or [v.lower() for v in parse_qs(target.query).get('EnvironmentId', [])] != [v.lower() for v in parse_qs(expected.query).get('EnvironmentId', [])]:
                 raise AutomationError('environment', 'Environment URL does not match the configured project/environment; refusing access changes.')
         elif target.path != f'/V2/EnvironmentDetailsV3New/{self.config.project_id}':
             raise AutomationError('environment', 'Environment page does not belong to the configured LCS project; refusing access changes.')
@@ -196,59 +276,83 @@ class LCSAutomation:
         if not self.config.environment_id:
             self.config.environment_id = name # Discovered only after URL/project/GUID verification.
 
-    def navigate(self) -> None:
+    def navigate(self, *, allow_interactive_auth: bool = False) -> None:
         self.step = 'authentication'
-        url = self.config.environment_url or f'{LCS_URL}/V2/Project/{self.config.project_id}/'
+        origin_url = self.config.lcs_origin
+        url = self.config.environment_url or f'{origin_url}/V2/Project/{self.config.project_id}/'
         for attempt in range(3):
             try:
                 self.page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                self._complete_lcs_landing(url)
                 if self.config.environment_url:
                     self.locator('accounts').wait_for(state='visible', timeout=30000)
                     self.verify_environment()
+                    save_auth(self.context, self.config.state_path, self.config.auth_key_path)
                     self.screenshot('01_login')
                     return
                 self.locator('environment_link').wait_for(state='visible', timeout=30000)
-                if not self.page.url.startswith(LCS_URL + '/'):
+                if not self.page.url.startswith(origin_url + '/'):
                     raise AutomationError('authentication', 'Authentication expired or MFA/Conditional Access requires interaction. Run bootstrap on this trusted host.')
+                save_auth(self.context, self.config.state_path, self.config.auth_key_path)
                 self.screenshot('01_login')
                 self.locator('environment_link').click()
                 self.locator('accounts').wait_for(state='visible', timeout=30000)
                 self.verify_environment()
                 return
-            except AutomationError:
+            except AutomationError as auth_error:
+                if allow_interactive_auth and auth_error.step == 'authentication':
+                    self.bootstrap(navigate_first=False)
+                    self.screenshot('01_login')
+                    return
                 raise
             except BrowserError:
                 from urllib.parse import urlsplit
                 origin = urlsplit(self.page.url).hostname
-                if origin in {'login.microsoftonline.com', 'login.live.com'}:
-                    raise AutomationError('authentication', 'Saved login requires sign-in/MFA. Run ./run.ps1 -ForceInteractive.') from None
-                if self.page.url.startswith(LCS_URL + '/') and self.page.get_by_role('button', name='Maintain', exact=True).count():
+                if origin in LOGIN_HOSTS or not self.page.url.startswith(origin_url + '/'):
+                    if allow_interactive_auth:
+                        self.bootstrap(navigate_first=False)
+                        self.screenshot('01_login')
+                        return
+                    if origin in LOGIN_HOSTS:
+                        raise AutomationError('authentication', 'Saved login requires sign-in/MFA. Run ./run.ps1 -ForceInteractive.') from None
+                if self.page.url.startswith(origin_url + '/') and self.page.get_by_role('button', name='Maintain', exact=True).count():
                     raise AutomationError('environment', f'Environment not found in project {self.config.project_id}; check ENVIRONMENT_ID and environment_link selector.') from None
                 if attempt < 2:
                     time.sleep(2 ** attempt)
-        if self.page.url.startswith(LCS_URL + '/'):
+        if self.page.url.startswith(origin_url + '/'):
             raise AutomationError('environment', f'Environment not found in project {self.config.project_id}; check permissions and environment_link selector.')
+        if allow_interactive_auth:
+            self.bootstrap(navigate_first=False)
+            self.screenshot('01_login')
+            return
         raise AutomationError('authentication', 'Login failed after three attempts. Re-run bootstrap; Entra MFA/Conditional Access cannot be bypassed.')
 
-    def bootstrap(self) -> None:
+    def bootstrap(self, *, navigate_first: bool = True) -> None:
+        origin_url = self.config.lcs_origin
+        target_url = self.config.environment_url or f'{origin_url}/V2/Project/{self.config.project_id}/'
+        if navigate_first:
+            self.page.goto(target_url, wait_until='domcontentloaded', timeout=30000)
         if self.config.environment_url:
-            self.page.goto(self.config.environment_url, wait_until='domcontentloaded', timeout=30000)
             print('Complete sign-in and MFA; wait for the environment page to load, then press Enter here.', file=sys.stderr)
             input()
-            if not self.page.url.startswith(LCS_URL + '/'):
+            self._complete_lcs_landing(target_url)
+            if not self.page.url.startswith(origin_url + '/'):
                 raise AutomationError('authentication', 'Sign in and open the configured environment before saving authentication.')
             try:
+                self.locator('accounts').wait_for(state='visible', timeout=30000)
                 self.page.locator('h1').wait_for(state='visible', timeout=30000)
                 self.verify_environment()
+                self.wait_idle()
             except BrowserError:
                 raise AutomationError('environment', 'Environment heading does not match ENVIRONMENT_ID; refusing to save authentication.') from None
         else:
-            self.page.goto(f'{LCS_URL}/V2/Project/{self.config.project_id}/', wait_until='domcontentloaded')
             print('Complete sign-in and MFA in the browser; open the project, then press Enter here.', file=sys.stderr)
             input()
-            if not self.page.url.startswith(f'{LCS_URL}/V2/Project/{self.config.project_id}'):
+            self._complete_lcs_landing(target_url)
+            if not self.page.url.startswith(f'{origin_url}/V2/Project/{self.config.project_id}'):
                 raise AutomationError('authentication', 'Open the configured LCS project before saving authentication.')
             self.locator('environment_link').wait_for(state='visible', timeout=30000)
+            self.wait_idle()
         save_auth(self.context, self.config.state_path, self.config.auth_key_path)
 
     def enable_ip(self, public_ip: str) -> None:
