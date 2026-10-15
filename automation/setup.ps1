@@ -19,11 +19,15 @@ function Get-RegistryPythonCandidates {
             if (-not (Test-Path -LiteralPath $Key)) { continue }
             $Props = Get-ItemProperty -LiteralPath $Key -ErrorAction SilentlyContinue
             if ($null -eq $Props) { continue }
+            # A normal registration records the same interpreter twice (ExecutablePath
+            # and the InstallPath default); probe each path only once.
             if ($Props.PSObject.Properties['ExecutablePath'] -and $Props.ExecutablePath) {
-                $Candidates.Add([string]$Props.ExecutablePath)
+                $Executable = [string]$Props.ExecutablePath
+                if (-not $Candidates.Contains($Executable)) { $Candidates.Add($Executable) }
             }
             if ($Props.PSObject.Properties['(default)'] -and $Props.'(default)') {
-                $Candidates.Add((Join-Path ([string]$Props.'(default)') 'python.exe'))
+                $FromDefault = Join-Path ([string]$Props.'(default)') 'python.exe'
+                if (-not $Candidates.Contains($FromDefault)) { $Candidates.Add($FromDefault) }
             }
         }
     }
@@ -126,8 +130,18 @@ function Unpack-PythonInstaller {
         foreach ($Payload in $Payloads) {
             & $Expand $CabPath ("-F:{0}" -f $Payload.Id) $WorkDir *> $null
             if ($LASTEXITCODE -ne 0) { throw "Failed to extract $($Payload.Name) from Python installer." }
+            # Payload ids are taken from the verified 3.13.16 amd64 container layout.
+            # Refuse anything that is not an installable MSI (OLE2/compound file) rather
+            # than handing an unexpected file to msiexec after a layout change.
+            $Extracted = Join-Path $WorkDir $Payload.Id
+            $Header = New-Object byte[] 8
+            $Stream = [IO.File]::OpenRead($Extracted)
+            try { $Read = $Stream.Read($Header, 0, $Header.Length) } finally { $Stream.Dispose() }
+            if ($Read -ne 8 -or [BitConverter]::ToString($Header) -ne 'D0-CF-11-E0-A1-B1-1A-E1') {
+                throw "The Python installer's attached container no longer matches the verified payload layout: $($Payload.Id) is not the expected $($Payload.Name) package."
+            }
             $MsiPath = Join-Path $WorkDir $Payload.Name
-            Move-Item -LiteralPath (Join-Path $WorkDir $Payload.Id) -Destination $MsiPath -Force
+            Move-Item -LiteralPath $Extracted -Destination $MsiPath -Force
             $MsiLog = Join-Path $Cache ("python-admin-$($Payload.Name).log")
             Invoke-SetupProcess -Executable $MsiExec -LogPath $MsiLog -Arguments @(
                 '/a', ('"{0}"' -f $MsiPath), '/qn', '/norestart',
@@ -144,16 +158,36 @@ function Install-LocalPython {
     param([string]$AppDir)
     $Cache = Join-Path $AppDir 'runtime/installers'
     $Target = Join-Path $AppDir 'runtime/python'
-    Write-Host 'Installing Python 3.13.16 locally (no PATH changes)...'
+    $Python = Join-Path $Target 'python.exe'
+    Write-Host 'Installing Python 3.13.16 into automation/runtime/python (no PATH changes)...'
     $Installer = Get-VerifiedInstaller `
         -Url 'https://www.python.org/ftp/python/3.13.16/python-3.13.16-amd64.exe' `
         -Destination (Join-Path $Cache 'python-3.13.16-amd64.exe') `
         -Publisher 'O=Python Software Foundation(?:,|$)' `
         -Sha256 'fb4f9f5d438b2396da0086dc70b935c530cb578e37adc6d354f7ad2037fee83b'
+    # Preferred path: extract the attached MSI container from the verified download.
+    # An administrative install writes only files under TargetDir. It creates no
+    # Windows Installer product, no ARP (Apps > Installed apps) entry and no PATH or
+    # PEP 514 registry entry, so deleting or moving the project folder cannot leave a
+    # stale Python 3.13 registration behind. Such a registration makes every later run
+    # a no-op Modify whose /uninstall fails (for example 1603 from pip.msi) because
+    # python.exe is missing at the recorded InstallDirectory.
+    $ExtractError = $null
+    try {
+        Unpack-PythonInstaller -Installer $Installer -Target $Target -Cache $Cache
+    }
+    catch { $ExtractError = $_.Exception.Message }
+    if (Test-SupportedPython $Python) { return $Python }
+    # Fallback for hosts where MSI administrative installation is blocked: the official
+    # per-user bundle installer. It registers a per-user 'Python 3.13.16 (64-bit)'
+    # entry, so remove it through Settings > Installed apps (or its recorded uninstall
+    # command) before deleting or moving the project folder.
+    Write-Host 'Local extraction did not produce an interpreter; using the official installer (registers a per-user Python entry)...'
+    if ($ExtractError) { Write-Host "Local extraction failed: $ExtractError" }
     $Log = Join-Path $Cache 'python-install.log'
     $InstallArgs = @(
         '/quiet', '/norestart', 'InstallAllUsers=0', 'PrependPath=0', 'Include_launcher=0',
-        'Include_test=0', 'Include_doc=0', 'Include_tcltk=0', 'AssociateFiles=0', 'Shortcuts=0',
+        'Include_test=0', 'Include_doc=0', 'Include_tcltk=0', 'Include_pip=1', 'AssociateFiles=0', 'Shortcuts=0',
         ('TargetDir="{0}"' -f $Target), '/log', ('"{0}"' -f $Log)
     )
     $InstallError = $null
@@ -161,32 +195,15 @@ function Install-LocalPython {
         Invoke-SetupProcess -Executable $Installer -LogPath $Log -Arguments $InstallArgs
     }
     catch {
-        # A required restart still stops the run; other installer failures may be a
-        # stale registration that the direct extraction below can recover from.
+        # A required restart still stops the run.
         if ($_.Exception.Message -match 'requires a restart') { throw }
         $InstallError = $_.Exception.Message
     }
-    $Python = Join-Path $Target 'python.exe'
     if (Test-SupportedPython $Python) { return $Python }
     $Found = Find-SupportedPython $AppDir
     if ($Found) { return $Found }
-    # If Python 3.13 was previously installed to a folder that was deleted or moved,
-    # WiX Burn reports the payloads as present: a normal run or /layout is a no-op
-    # Modify, and /uninstall fails (for example 1603 from pip.msi) because python.exe
-    # is missing at the stale InstallDirectory. Extract the attached MSI container
-    # from the verified installer directly into TargetDir instead.
-    Write-Host 'Repairing stale Python 3.13 installer registration...'
-    if ($InstallError) { Write-Host "Repairing after installer failure: $InstallError" }
-    try {
-        Unpack-PythonInstaller -Installer $Installer -Target $Target -Cache $Cache
-    }
-    catch {
-        if ($InstallError) { throw "$InstallError Local extraction also failed: $($_.Exception.Message)" }
-        throw
-    }
-    if (Test-SupportedPython $Python) { return $Python }
-    $Found = Find-SupportedPython $AppDir
-    if ($Found) { return $Found }
+    $Details = @($ExtractError, $InstallError) | Where-Object { $_ }
+    if ($Details) { throw "Python installation did not produce a usable x64 interpreter. $($Details -join ' ') Log: $Log" }
     throw "Python installation did not produce a usable x64 interpreter. Log: $Log"
 }
 
