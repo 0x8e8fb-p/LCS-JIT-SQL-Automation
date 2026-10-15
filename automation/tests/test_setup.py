@@ -136,3 +136,57 @@ catch {{ Write-Output $_.Exception.Message; exit 1 }}
 ''')
     assert result.returncode == 1
     assert 'Dependency step failed' in result.stdout
+
+
+def test_find_supported_python_discovers_registry_install_when_not_on_path(tmp_path):
+    reg_python = tmp_path / 'previous_folder' / 'runtime' / 'python' / 'python.exe'
+    reg_python.parent.mkdir(parents=True)
+    reg_python.write_text('fake-python')
+    result = invoke(tmp_path, f'''
+function Get-Command {{ param($Name, $ErrorAction) return $null }}
+function Get-RegistryPythonCandidates {{ return @({ps_quote(reg_python)}) }}
+function Test-SupportedPython {{ param($Executable, $Prefix) return ($Executable -eq {ps_quote(reg_python)}) }}
+$found = Find-SupportedPython -AppDir {ps_quote(tmp_path / 'new_app')}
+if ($found -ne {ps_quote(reg_python)}) {{ throw "Unexpected found: $found" }}
+Write-Output "found=$found"
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f'found={reg_python}' in result.stdout
+
+
+def test_install_local_python_repairs_stale_wix_burn_registration(tmp_path):
+    app = tmp_path / 'new_app'
+    target_py = app / 'runtime' / 'python' / 'python.exe'
+    result = invoke(tmp_path, f'''
+$script:Steps = New-Object 'System.Collections.Generic.List[string]'
+$script:Uninstalled = $false
+function Get-VerifiedInstaller {{
+    param($Url, $Destination, $Publisher, $Sha256)
+    New-Item -ItemType Directory -Force -Path (Split-Path $Destination) | Out-Null
+    Set-Content -LiteralPath $Destination -Value 'fake-installer'
+    return $Destination
+}}
+function Find-SupportedPython {{ param($AppDir) return $null }}
+function Test-SupportedPython {{
+    param($Executable, $Prefix)
+    return ($Executable -eq {ps_quote(target_py)} -and (Test-Path -LiteralPath $Executable))
+}}
+function Invoke-SetupProcess {{
+    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
+    if ($Arguments -contains '/uninstall') {{
+        $script:Steps.Add('uninstall')
+        $script:Uninstalled = $true
+    }} elseif ($script:Uninstalled) {{
+        $script:Steps.Add('clean-install')
+        New-Item -ItemType Directory -Force -Path {ps_quote(target_py.parent)} | Out-Null
+        Set-Content -LiteralPath {ps_quote(target_py)} -Value 'usable-python'
+    }} else {{
+        $script:Steps.Add('noop-modify')
+    }}
+}}
+$py = Install-LocalPython -AppDir {ps_quote(app)}
+if ($py -ne {ps_quote(target_py)}) {{ throw "Unexpected python: $py" }}
+Write-Output ('steps=' + ($script:Steps -join ','))
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'steps=noop-modify,uninstall,clean-install' in result.stdout

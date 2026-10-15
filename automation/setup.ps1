@@ -11,6 +11,25 @@ function Test-SupportedPython {
     return ($LASTEXITCODE -eq 0)
 }
 
+function Get-RegistryPythonCandidates {
+    $Candidates = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($Root in @('HKCU:\Software\Python\PythonCore', 'HKLM:\Software\Python\PythonCore')) {
+        foreach ($Version in @('3.13', '3.12', '3.11', '3.10')) {
+            $Key = Join-Path $Root "$Version\InstallPath"
+            if (-not (Test-Path -LiteralPath $Key)) { continue }
+            $Props = Get-ItemProperty -LiteralPath $Key -ErrorAction SilentlyContinue
+            if ($null -eq $Props) { continue }
+            if ($Props.PSObject.Properties['ExecutablePath'] -and $Props.ExecutablePath) {
+                $Candidates.Add([string]$Props.ExecutablePath)
+            }
+            if ($Props.PSObject.Properties['(default)'] -and $Props.'(default)') {
+                $Candidates.Add((Join-Path ([string]$Props.'(default)') 'python.exe'))
+            }
+        }
+    }
+    return $Candidates
+}
+
 function Find-SupportedPython {
     param([string]$AppDir)
     $Local = Join-Path $AppDir 'runtime/python/python.exe'
@@ -27,6 +46,11 @@ function Find-SupportedPython {
                 $Result = & $Launcher.Source $Version -c 'import sys; print(sys.executable)'
                 if ($LASTEXITCODE -eq 0) { return ($Result | Select-Object -Last 1) }
             }
+        }
+    }
+    foreach ($Candidate in (Get-RegistryPythonCandidates)) {
+        if ($Candidate -notmatch '[\\/]WindowsApps[\\/]' -and (Test-SupportedPython $Candidate)) {
+            return $Candidate
         }
     }
     return $null
@@ -73,14 +97,29 @@ function Install-LocalPython {
         -Publisher 'O=Python Software Foundation(?:,|$)' `
         -Sha256 'fb4f9f5d438b2396da0086dc70b935c530cb578e37adc6d354f7ad2037fee83b'
     $Log = Join-Path $Cache 'python-install.log'
-    Invoke-SetupProcess -Executable $Installer -LogPath $Log -Arguments @(
+    $InstallArgs = @(
         '/quiet', '/norestart', 'InstallAllUsers=0', 'PrependPath=0', 'Include_launcher=0',
         'Include_test=0', 'Include_doc=0', 'Include_tcltk=0', 'AssociateFiles=0', 'Shortcuts=0',
         ('TargetDir="{0}"' -f $Target), '/log', ('"{0}"' -f $Log)
     )
+    Invoke-SetupProcess -Executable $Installer -LogPath $Log -Arguments $InstallArgs
     $Python = Join-Path $Target 'python.exe'
-    if (-not (Test-SupportedPython $Python)) { throw "Python installation did not produce a usable x64 interpreter. Log: $Log" }
-    return $Python
+    if (Test-SupportedPython $Python) { return $Python }
+    $Found = Find-SupportedPython $AppDir
+    if ($Found) { return $Found }
+    # If Python 3.13 was previously installed to a deleted/moved folder, WiX Burn
+    # treats a normal run as a no-op Modify. Uninstall the stale registration and
+    # perform a clean install into TargetDir.
+    Write-Host 'Repairing stale Python 3.13 installer registration...'
+    $UninstallLog = Join-Path $Cache 'python-uninstall.log'
+    Invoke-SetupProcess -Executable $Installer -LogPath $UninstallLog -Arguments @(
+        '/uninstall', '/quiet', '/norestart', '/log', ('"{0}"' -f $UninstallLog)
+    )
+    Invoke-SetupProcess -Executable $Installer -LogPath $Log -Arguments $InstallArgs
+    if (Test-SupportedPython $Python) { return $Python }
+    $Found = Find-SupportedPython $AppDir
+    if ($Found) { return $Found }
+    throw "Python installation did not produce a usable x64 interpreter. Log: $Log"
 }
 
 function Test-SqlDriver {
