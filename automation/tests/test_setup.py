@@ -154,12 +154,16 @@ Write-Output "found=$found"
     assert f'found={reg_python}' in result.stdout
 
 
-def test_install_local_python_repairs_stale_wix_burn_registration(tmp_path):
+@pytest.mark.parametrize(('installer_failure', 'expected'), [
+    ('', 'steps=noop-modify,unpack'),
+    # Burn can also fail outright (for example 1603) instead of no-op'ing.
+    ('Installer failed (exit 1603). Log: python-install.log', 'steps=install-failed,unpack'),
+])
+def test_install_local_python_repairs_stale_wix_burn_registration(tmp_path, installer_failure, expected):
     app = tmp_path / 'new_app'
     target_py = app / 'runtime' / 'python' / 'python.exe'
     result = invoke(tmp_path, f'''
 $script:Steps = New-Object 'System.Collections.Generic.List[string]'
-$script:Uninstalled = $false
 function Get-VerifiedInstaller {{
     param($Url, $Destination, $Publisher, $Sha256)
     New-Item -ItemType Directory -Force -Path (Split-Path $Destination) | Out-Null
@@ -173,20 +177,92 @@ function Test-SupportedPython {{
 }}
 function Invoke-SetupProcess {{
     param($Executable, $Arguments, [switch]$Elevate, $LogPath)
-    if ($Arguments -contains '/uninstall') {{
-        $script:Steps.Add('uninstall')
-        $script:Uninstalled = $true
-    }} elseif ($script:Uninstalled) {{
-        $script:Steps.Add('clean-install')
-        New-Item -ItemType Directory -Force -Path {ps_quote(target_py.parent)} | Out-Null
-        Set-Content -LiteralPath {ps_quote(target_py)} -Value 'usable-python'
-    }} else {{
-        $script:Steps.Add('noop-modify')
-    }}
+    if ({ps_quote(installer_failure)}) {{ $script:Steps.Add('install-failed'); throw {ps_quote(installer_failure)} }}
+    $script:Steps.Add('noop-modify')
+}}
+function Unpack-PythonInstaller {{
+    param($Installer, $Target, $Cache)
+    $script:Steps.Add('unpack')
+    New-Item -ItemType Directory -Force -Path (Split-Path {ps_quote(target_py)}) | Out-Null
+    Set-Content -LiteralPath {ps_quote(target_py)} -Value 'usable-python'
 }}
 $py = Install-LocalPython -AppDir {ps_quote(app)}
 if ($py -ne {ps_quote(target_py)}) {{ throw "Unexpected python: $py" }}
 Write-Output ('steps=' + ($script:Steps -join ','))
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
-    assert 'steps=noop-modify,uninstall,clean-install' in result.stdout
+    assert expected in result.stdout
+
+
+def test_install_local_python_restart_requirement_stops_instead_of_extracting(tmp_path):
+    app = tmp_path / 'new_app'
+    result = invoke(tmp_path, f'''
+$script:Steps = New-Object 'System.Collections.Generic.List[string]'
+function Get-VerifiedInstaller {{
+    param($Url, $Destination, $Publisher, $Sha256)
+    New-Item -ItemType Directory -Force -Path (Split-Path $Destination) | Out-Null
+    Set-Content -LiteralPath $Destination -Value 'fake-installer'
+    return $Destination
+}}
+function Find-SupportedPython {{ param($AppDir) return $null }}
+function Test-SupportedPython {{ param($Executable, $Prefix) return $false }}
+function Invoke-SetupProcess {{
+    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
+    throw "Installation requires a restart. Restart Windows and rerun ./run.ps1. Log: python-install.log"
+}}
+function Unpack-PythonInstaller {{
+    param($Installer, $Target, $Cache)
+    $script:Steps.Add('unpack')
+}}
+try {{ Install-LocalPython -AppDir {ps_quote(app)}; throw 'Restart requirement ignored' }}
+catch {{
+    if ($_.Exception.Message -eq 'Restart requirement ignored') {{ throw }}
+    Write-Output $_.Exception.Message
+}}
+Write-Output ('steps=' + ($script:Steps -join ','))
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'requires a restart' in result.stdout
+    # Nothing was extracted: the restart instruction still stops the run.
+    assert 'steps=\n' in result.stdout
+
+
+def test_unpack_python_installer_extracts_attached_msi_container(tmp_path):
+    import struct
+    installer = tmp_path / 'fake-python.exe'
+    cab_bytes = bytearray(10_000_064)
+    cab_bytes[0:8] = b'MSCF\x00\x00\x00\x00'
+    struct.pack_into('<I', cab_bytes, 8, 10_000_032)
+    cab_bytes[24] = 3
+    cab_bytes[25] = 1
+    installer.write_bytes(b'MZ' + b'\x00' * 126 + bytes(cab_bytes))
+    target_dir = tmp_path / 'target'
+    cache_dir = tmp_path / 'cache'
+    cache_dir.mkdir()
+    result = invoke(tmp_path, f'''
+$script:Msis = New-Object 'System.Collections.Generic.List[string]'
+$FakeBin = Join-Path {ps_quote(tmp_path)} 'fake-sys/System32'
+New-Item -ItemType Directory -Force -Path $FakeBin | Out-Null
+Set-Content -LiteralPath (Join-Path $FakeBin 'expand.exe') -Value ''
+$env:SystemRoot = Join-Path {ps_quote(tmp_path)} 'fake-sys'
+Set-Alias -Name (Join-Path $FakeBin 'expand.exe') -Value Invoke-FakeExpand
+function Invoke-FakeExpand {{
+    param($Cab, $Flag, $WorkDir)
+    if ((Get-Item -LiteralPath $Cab).Length -ne 10000032) {{ throw 'Unexpected CAB length' }}
+    $Id = $Flag -replace '^-F:', ''
+    Set-Content -LiteralPath (Join-Path $WorkDir $Id) -Value "msi-$Id"
+    $global:LASTEXITCODE = 0
+}}
+function Invoke-SetupProcess {{
+    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
+    $MsiPath = $Arguments[1] -replace '"', ''
+    if (-not (Test-Path -LiteralPath $MsiPath)) {{ throw "Missing extracted MSI: $MsiPath" }}
+    $script:Msis.Add([IO.Path]::GetFileName($MsiPath))
+}}
+Unpack-PythonInstaller -Installer {ps_quote(installer)} -Target {ps_quote(target_dir)} -Cache {ps_quote(cache_dir)}
+if (Test-Path -LiteralPath (Join-Path {ps_quote(cache_dir)} 'python-unpack')) {{ throw 'WorkDir not cleaned up' }}
+Write-Output ('msis=' + ($script:Msis -join ','))
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'msis=core.msi,exe.msi,dev.msi,lib.msi' in result.stdout
+
