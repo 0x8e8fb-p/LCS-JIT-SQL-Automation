@@ -101,8 +101,8 @@ def test_prepared_scripts_execute_validated_snapshot(tmp_path, monkeypatch):
 def test_diagnostic_disk_failure_preserves_cleanup_outcome(tmp_path, monkeypatch, sql_failed):
     adapter = make_adapter(AutomationError('cleanup', 'Owned rule still present.'))
     monkeypatch.setattr(main, 'LCSAutomation', lambda *a, **k: adapter)
-    monkeypatch.setattr(main, 'get_public_ip', lambda _: '8.8.8.8')
-    def execute(*args):
+    monkeypatch.setattr(main, 'get_public_ip', lambda _: ('8.8.8.8', 'auto_direct'))
+    def execute(*args, **kwargs):
         if sql_failed:
             raise AutomationError('sql_connection', 'Connection unavailable.')
         return {'scripts_failed': 0, 'scripts_executed': 1}

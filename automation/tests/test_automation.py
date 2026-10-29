@@ -131,13 +131,14 @@ def test_expiry_rolls_back_and_stops_even_with_continue(config, credentials, mon
 
 
 def test_connection_retry(config, credentials, monkeypatch):
-    connect = MagicMock(side_effect=pyodbc.Error('08001', credentials.password))
+    connect = MagicMock(side_effect=pyodbc.Error('08001', credentials.password + ' (10060)'))
     monkeypatch.setattr(sql.pyodbc, 'connect', connect)
     monkeypatch.setattr(sql.time, 'sleep', lambda _: None)
-    with pytest.raises(AutomationError, match='failed twice') as error:
+    with pytest.raises(AutomationError, match='after 3 attempt') as error:
         sql.execute_sql_scripts(credentials, config)
     assert credentials.password not in str(error.value)
-    assert connect.call_count == 2
+    assert 'SQLSTATE 08001, native 10060' in error.value.message
+    assert connect.call_count == 3
 
 
 def test_stop_and_rollback_failure(config, credentials, monkeypatch):

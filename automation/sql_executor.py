@@ -1,6 +1,7 @@
 """Local Azure SQL runner; scripts must be trusted, transaction-compatible T-SQL."""
 from __future__ import annotations
 
+import ipaddress
 import math
 from dataclasses import dataclass
 import re
@@ -13,7 +14,7 @@ try:
 except ImportError:  # Reported clearly by check_runtime / execute_sql_scripts when SQL is needed.
     pyodbc = None  # type: ignore[assignment]
 
-from automation_support import AutomationError, Config, Credentials, safe_file_name, timestamp, utcnow
+from automation_support import AutomationError, Config, Credentials, odbc_codes, safe_file_name, timestamp, utcnow
 
 
 def split_batches(sql: str) -> list[str]:
@@ -180,20 +181,46 @@ def safe_sql_error(error: pyodbc.Error) -> str:
     return f'SQL operation failed (SQLSTATE {state}). Check permissions, T-SQL syntax, query timeout, and JIT/firewall validity; driver details suppressed for security.'
 
 
-def execute_sql_scripts(credentials: Credentials, config: Config, files: list[Path] | list[PreparedScript] | None = None) -> dict[str, Any]:
-    if pyodbc is None:
-        raise AutomationError('sql_connection', 'The pyodbc ODBC module could not load. Rerun run.cmd to repair automation/.venv.')
-    files = prepare_scripts(config.scripts_path) if files is None else files
-    results: dict[str, Any] = {
-        'total_scripts': len(files), 'scripts_executed': 0, 'scripts_failed': 0,
-        'execution_time_seconds': 0.0, 'details': [],
-    }
-    started = time.monotonic()
-    credentials.ensure_valid('sql_connection')
-    connection: Any = None
-    # Retrying a connection/preflight is safe; script execution is NEVER retried.
-    for attempt in range(2):
+# Azure SQL guidance: retry after 5 s, doubling up to 60 s. A new firewall rule
+# can take up to about 5 minutes to apply, and a new JIT login can lag.
+RETRY_FIRST_SECONDS = 5
+RETRY_MAX_SECONDS = 60
+RETRY_BUDGET_SECONDS = 300
+NETWORK_ATTEMPTS = 3
+FIREWALL_REFUSED = 40615
+LOGIN_FAILED = 18456
+CLIENT_IP = re.compile(r"IP address '(\d{1,3}(?:\.\d{1,3}){3})'")
+
+
+def refused_client_ip(error: BaseException) -> str | None:
+    """The client IPv4 Azure SQL reports in error 40615; nothing else of the message is kept."""
+    for argument in error.args[1:]:
+        match = CLIENT_IP.search(str(argument))
+        if match:
+            try:
+                return str(ipaddress.IPv4Address(match.group(1)))
+            except ValueError:
+                return None
+    return None
+
+
+def connection_failure(codes: dict[str, Any], attempts: int, waited: float) -> str:
+    native = ', '.join(str(number) for number in codes.get('native', [])) or 'none'
+    return (f'Could not connect to Azure SQL after {attempts} attempt(s) over {waited:g} s (SQLSTATE {codes.get("sqlstate", "unknown")}, native {native}). '
+            'Check outbound TCP 1433 and, for the Redirect connection policy, TCP 11000-11999 to Azure SQL, plus VPN/proxy routing and DNS '
+            'for the server. See README.md#troubleshooting.')
+
+
+def connect_with_retry(credentials: Credentials, config: Config, firewall_ip: str | None, ip_source: str | None) -> tuple[Any, int, float]:
+    """Open the connection and run SELECT 1. Only connecting is retried, never scripts."""
+    attempts = 0
+    waited = 0.0
+    delay = float(RETRY_FIRST_SECONDS)
+    network_failures = 0
+    while True:
+        attempts += 1
         credentials.ensure_valid('sql_connection')
+        connection: Any = None
         try:
             connection = pyodbc.connect(connection_string(credentials, config.odbc_driver), autocommit=False, timeout=30)
             connection.timeout = config.sql_timeout
@@ -206,19 +233,56 @@ def execute_sql_scripts(credentials: Credentials, config: Config, files: list[Pa
             finally:
                 cursor.close()
             connection.rollback()
-            break
-        except pyodbc.Error:
+            return connection, attempts, waited
+        except pyodbc.Error as error:
             if connection is not None:
                 connection.close()
-                connection = None
-            if attempt == 0:
-                time.sleep(2)
+            codes = odbc_codes(error) or {'sqlstate': 'unknown'}
+            natives = codes.get('native', [])
+            if codes.get('sqlstate') == 'IM002':
+                raise AutomationError('sql_connection', f'The ODBC driver "{config.odbc_driver}" was not found by the ODBC driver manager. '
+                                      'Rerun run.cmd to reinstall Microsoft ODBC Driver 18 for SQL Server (x64).') from None
+            if FIREWALL_REFUSED in natives:
+                seen = refused_client_ip(error)
+                if seen and firewall_ip and seen != firewall_ip:
+                    detected = {'config': 'from PUBLIC_IP in config.yaml', 'auto_direct': 'detected directly',
+                                'auto_proxy': 'detected through the web proxy'}.get(ip_source or '', 'detected')
+                    raise AutomationError('sql_connection', f'Azure SQL saw this computer as {seen}, but the LCS firewall rule was created for {firewall_ip} '
+                                          f'({detected}). Your SQL traffic leaves from a different address than your web traffic (proxy, VPN or split tunnel). '
+                                          f'Add PUBLIC_IP: "{seen}" to config.yaml and rerun; the rule for {firewall_ip} is removed by cleanup.') from None
+                reason = f'Azure SQL still refuses {seen or firewall_ip or "this computer"} (error 40615). The new LCS firewall rule may not have applied yet.'
+            elif LOGIN_FAILED in natives:
+                reason = 'Azure SQL still rejects the JIT login (error 18456). The new credential may not be active yet, or it was revoked.'
             else:
-                raise AutomationError('sql_connection', 'Azure SQL connection/preflight failed twice. Verify the configured ODBC driver, outbound TCP 1433/Azure SQL redirect ports, source egress IP, active firewall/JIT window, DNS, TLS, and database movement status.') from None
+                network_failures += 1
+                if network_failures >= NETWORK_ATTEMPTS:
+                    raise AutomationError('sql_connection', connection_failure(codes, attempts, waited)) from None
+                reason = ''
+            remaining = (credentials.expires_at - utcnow()).total_seconds()
+            if waited + delay > RETRY_BUDGET_SECONDS or delay >= remaining:
+                raise AutomationError('sql_connection', (reason + ' ' if reason else '') + f'Gave up after {attempts} attempt(s) over {waited:g} s. '
+                                      'Retry later; if 40615 persists, confirm with IT which public IPv4 your SQL traffic uses and set PUBLIC_IP in config.yaml.') from None
+            time.sleep(delay)
+            waited += delay
+            delay = min(delay * 2, RETRY_MAX_SECONDS)
         except Exception:
             if connection is not None:
                 connection.close()
             raise
+
+
+def execute_sql_scripts(credentials: Credentials, config: Config, files: list[Path] | list[PreparedScript] | None = None, *,
+                        firewall_ip: str | None = None, ip_source: str | None = None) -> dict[str, Any]:
+    if pyodbc is None:
+        raise AutomationError('sql_connection', 'The pyodbc ODBC module could not load. Rerun run.cmd to repair automation/.venv.')
+    files = prepare_scripts(config.scripts_path) if files is None else files
+    results: dict[str, Any] = {
+        'total_scripts': len(files), 'scripts_executed': 0, 'scripts_failed': 0,
+        'execution_time_seconds': 0.0, 'details': [],
+    }
+    started = time.monotonic()
+    connection, attempts, waited = connect_with_retry(credentials, config, firewall_ip, ip_source)
+    results['sql_connection'] = {'attempts': attempts, 'waited_seconds': waited}
     try:
         for file in files:
             script_start = time.monotonic()

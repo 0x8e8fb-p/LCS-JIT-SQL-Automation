@@ -8,8 +8,8 @@ from helpers import make_adapter, make_config
 def run_with(monkeypatch, tmp_path, error):
     adapter = make_adapter(error)
     monkeypatch.setattr(main, 'LCSAutomation', lambda *a, **k: adapter)
-    monkeypatch.setattr(main, 'get_public_ip', lambda _: '8.8.8.8')
-    monkeypatch.setattr(main, 'execute_sql_scripts', lambda *a: {'scripts_failed': 0, 'scripts_executed': 1})
+    monkeypatch.setattr(main, 'get_public_ip', lambda _: ('8.8.8.8', 'auto_direct'))
+    monkeypatch.setattr(main, 'execute_sql_scripts', lambda *a, **k: {'scripts_failed': 0, 'scripts_executed': 1})
     return main.run(make_config(), tmp_path)
 
 

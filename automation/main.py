@@ -85,11 +85,13 @@ def run(config: Config, log_dir: Path, *, headed: bool = False, interactive_auth
             else:
                 adapter.navigate(allow_interactive_auth=headed)
             step = 'ip_rule'
-            adapter.enable_ip(get_public_ip(config))
+            public_ip, ip_source = get_public_ip(config)
+            adapter.ip_source = ip_source
+            adapter.enable_ip(public_ip)
             step = 'jit_request'
             credentials = adapter.request_access()
             step = 'sql_connection'
-            execution = execute_sql_scripts(credentials, config, scripts)
+            execution = execute_sql_scripts(credentials, config, scripts, firewall_ip=public_ip, ip_source=ip_source)
             output = {
                 'status': 'failure' if execution['scripts_failed'] else 'success',
                 'jit_request': {
@@ -141,6 +143,10 @@ def run(config: Config, log_dir: Path, *, headed: bool = False, interactive_auth
                     warnings = getattr(adapter, 'warnings', None)
                     if isinstance(warnings, list) and warnings:
                         output['warnings'] = list(warnings)
+                    public_ip = getattr(adapter, 'public_ip', '')
+                    if isinstance(public_ip, str) and public_ip:
+                        output['firewall'] = {'public_ip': public_ip, 'public_ip_source': str(getattr(adapter, 'ip_source', '') or config.public_ip_source),
+                                              'rule_name': str(getattr(adapter, 'rule_name', '') or '') or None}
                     date_format = getattr(adapter, 'lcs_date_format', '')
                     if isinstance(date_format, str) and date_format:
                         output['lcs_date_format'] = date_format  # How LCS rendered expiry dates on this machine.

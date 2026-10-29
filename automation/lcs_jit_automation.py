@@ -16,7 +16,7 @@ from typing import Any, Literal, Sequence, cast
 from datetime import datetime
 from playwright._impl._api_structures import SetCookieParam, StorageState
 import sys
-from urllib.request import urlopen
+from urllib.request import BaseHandler, ProxyHandler, build_opener
 
 from cryptography.fernet import Fernet, InvalidToken
 from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwright, Error as BrowserError
@@ -257,18 +257,29 @@ def wait_for_enter(prompt: str) -> None:
                               '-Headless runs reuse that login.') from None
 
 
-def get_public_ip(config: Config) -> str:
-    if config.public_ip:
-        return config.public_ip
+IP_SERVICE = 'https://api.ipify.org'
+
+
+def _detect_ip(handlers: Sequence[BaseHandler]) -> str | None:
     try:
-        with urlopen('https://api.ipify.org', timeout=10) as response:
+        with build_opener(*handlers).open(IP_SERVICE, timeout=10) as response:
             value = response.read(128).decode('ascii').strip()
         address = ipaddress.ip_address(value)
-        if not isinstance(address, ipaddress.IPv4Address) or not address.is_global:
-            raise ValueError('global IPv4 required')
-        return str(address)
     except Exception:
-        raise AutomationError('ip_rule', 'Public IPv4 detection failed. Set PUBLIC_IP to the SQL host egress IPv4 and verify proxy/VPN routing.') from None
+        return None
+    return str(address) if isinstance(address, ipaddress.IPv4Address) and address.is_global else None
+
+
+def get_public_ip(config: Config) -> tuple[str, str]:
+    """(public IPv4, source). SQL traffic goes direct, so a direct lookup is tried first."""
+    if config.public_ip:
+        return config.public_ip, 'config'
+    for source, handlers in (('auto_direct', [ProxyHandler({})]), ('auto_proxy', [])):
+        address = _detect_ip(handlers)
+        if address:
+            return address, source
+    raise AutomationError('ip_rule', 'Public IPv4 detection failed, directly and through the system proxy (api.ipify.org may be blocked). '
+                          'Add PUBLIC_IP: "<public IPv4 your SQL traffic leaves from>" to config.yaml (IT can tell you) and rerun.')
 
 
 class LCSAutomation:
@@ -338,6 +349,7 @@ class LCSAutomation:
             raise AutomationError('browser_start', self._browser_start_message(error, profile_dir)) from None
         self.ip_rule_attempted = False
         self.public_ip = ''
+        self.ip_source = ''
         self.requested_at = utcnow()
         self.firewall_expires_at = utcnow()
         self.step = 'authentication'
