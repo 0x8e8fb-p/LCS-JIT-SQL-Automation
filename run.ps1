@@ -29,6 +29,11 @@ param(
     [switch]$ValidateOnly
 )
 
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    # First statement: Constrained Language mode blocks the .NET calls used below.
+    Write-Host "Launcher failed: PowerShell runs in $($ExecutionContext.SessionState.LanguageMode) mode (application control). Ask IT to allow this project's scripts (run.ps1 and automation\setup.ps1)." -ForegroundColor Red
+    exit 1
+}
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 # Native failures are checked explicitly, including on PowerShell 7.3+.

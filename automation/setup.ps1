@@ -20,6 +20,9 @@ $script:SetupLog = $null
 $script:SetupChecks = Join-Path $PSScriptRoot 'setup_checks.py'
 # Microsoft's stable link to the current ODBC Driver 18 for SQL Server x64 MSI (18.7.1.1 when verified).
 $script:OdbcDriverUrl = 'https://go.microsoft.com/fwlink/?linkid=2378279'
+# Small files that must download for this version (reachability check only).
+$script:PypiProbeUrl = 'https://files.pythonhosted.org/packages/a0/c4/b4d4827c93ef43c01f599ef31453ccc1c132b353284fc6c87d535c233129/pyee-13.0.1-py3-none-any.whl'
+$script:ChromiumProbeUrl = 'https://cdn.playwright.dev/builds/cft/153.0.8010.12/win64/chrome-win64.zip'
 
 function Write-SetupLog {
     param([string[]]$Lines)
@@ -178,6 +181,20 @@ function Export-WindowsCertificates {
     return $true
 }
 
+function Get-ProxyBypassList {
+    <# Hosts the Windows proxy settings send direct (ProxyOverride), in NO_PROXY form. #>
+    try {
+        $Settings = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop
+        if (-not $Settings.PSObject.Properties['ProxyOverride'] -or -not $Settings.ProxyOverride) { return @() }
+        $Entries = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($Entry in ([string]$Settings.ProxyOverride -split ';')) {
+            $Value = $Entry.Trim() -replace '^\*\.', '.'
+            if ($Value -and $Value -ne '<local>' -and $Value -notmatch '\*') { $Entries.Add($Value) }
+        }
+        return @($Entries)
+    } catch { return @() }
+}
+
 function Set-ChildEnvironment {
     <#
         Process-scope environment for Python, pip and Playwright. Removes inherited
@@ -201,17 +218,25 @@ function Set-ChildEnvironment {
     $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $AppDir 'browsers'
     $env:PLAYWRIGHT_DOWNLOAD_NO_PROGRESS = '1'
     if (-not $env:PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT) { $env:PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT = '120000' }
+    foreach ($Name in @('HTTPS_PROXY', 'HTTP_PROXY')) {
+        $Value = [Environment]::GetEnvironmentVariable($Name)
+        if ($Value -and $Value -notmatch '^[A-Za-z][A-Za-z0-9+.-]*://') {
+            # pip accepts host:port, but PowerShell and Node need a scheme.
+            [Environment]::SetEnvironmentVariable($Name, 'http://' + $Value)
+        }
+    }
     if (-not $env:HTTPS_PROXY) {
         try {
             $Target = New-Object Uri('https://pypi.org/')
             $Proxy = [Net.WebRequest]::GetSystemWebProxy().GetProxy($Target)
             if ($null -ne $Proxy -and $Proxy.Authority -ne $Target.Authority) {
+                # Node (Playwright) reads no Windows proxy settings, so the system proxy is exported.
                 $Value = $Proxy.GetLeftPart([UriPartial]::Authority)
                 $env:HTTPS_PROXY = $Value
                 $env:HTTP_PROXY = $Value
-                if (-not $env:NO_PROXY) { $env:NO_PROXY = 'localhost,127.0.0.1,::1' }
+                if (-not $env:NO_PROXY) { $env:NO_PROXY = (@('localhost', '127.0.0.1', '::1') + @(Get-ProxyBypassList)) -join ',' }
                 Write-Host "Using the system proxy $Value for downloads."
-                Write-SetupLog @("system proxy: $Value")
+                Write-SetupLog @("system proxy: $Value", "no proxy for: $($env:NO_PROXY)")
             }
         } catch { Write-SetupLog @('system proxy detection failed') }
     }
@@ -277,6 +302,32 @@ $script:PythonPackageSize = 14817881
 $script:PythonPackageSha512 = 'TGEhuRTpWtRifDR4r/GEhmg/cGMqtwB4kOCkt1QhXnCmdDE3Dict3iLJI1xrsNSRbXGyCwLEhe6qa5Rd2s376w=='
 
 function New-ShortId { return [Guid]::NewGuid().ToString('N').Substring(0, 8) }
+
+function Move-ItemWithRetry {
+    <# Antivirus or the search indexer can hold freshly written files for a moment. #>
+    param([string]$Path, [string]$Destination)
+    for ($Attempt = 1; $true; $Attempt++) {
+        try { Move-Item -LiteralPath $Path -Destination $Destination -ErrorAction Stop; return }
+        catch {
+            if ($Attempt -ge 5) {
+                throw "Could not move $(Split-Path -Leaf $Path) to $(Split-Path -Leaf $Destination): a file is in use (often antivirus or another run). Close other runs and retry."
+            }
+            Start-Sleep -Milliseconds 800
+        }
+    }
+}
+
+function Remove-OldCopies {
+    <# Keeps the newest generated backup (old runtime or environment) and removes older ones. #>
+    param([string]$Parent, [string]$Filter, [int]$Keep = 1)
+    $Items = @(Get-ChildItem -LiteralPath $Parent -Directory -Force -Filter $Filter -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($Item in @($Items | Select-Object -Skip $Keep)) {
+        try {
+            Remove-Item -LiteralPath $Item.FullName -Recurse -Force -ErrorAction Stop
+            Write-SetupLog @("removed old copy $($Item.Name)")
+        } catch { Write-SetupLog @("could not remove old copy $($Item.Name)") }
+    }
+}
 
 function Convert-Base64ToHex {
     param([string]$Base64)
@@ -364,12 +415,18 @@ function Initialize-RuntimePython {
         }
         $Marker = @{ version = $script:PythonVersion; sha512 = $script:PythonPackageSha512; source = $script:PythonPackageUrl } | ConvertTo-Json
         [IO.File]::WriteAllText((Join-Path $Staging '.lcsjit-runtime.json'), $Marker)
+        $Old = $null
         if (Test-Path -LiteralPath $Runtime) {
             $Old = Join-Path $AppDir ('runtime/python.old-' + (New-ShortId))
             Write-Host "Keeping the previous automation\runtime\python as $(Split-Path -Leaf $Old)."
-            Move-Item -LiteralPath $Runtime -Destination $Old
+            Move-ItemWithRetry -Path $Runtime -Destination $Old
         }
-        Move-Item -LiteralPath $Staging -Destination $Runtime
+        try { Move-ItemWithRetry -Path $Staging -Destination $Runtime }
+        catch {
+            if ($Old -and -not (Test-Path -LiteralPath $Runtime)) { Move-ItemWithRetry -Path $Old -Destination $Runtime }
+            throw
+        }
+        Remove-OldCopies -Parent (Join-Path $AppDir 'runtime') -Filter 'python.old-*' -Keep 1
     } finally {
         if (Test-Path -LiteralPath $Staging) { Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue }
     }
@@ -411,10 +468,11 @@ function Initialize-Venv {
         Move-Item -LiteralPath $Venv -Destination $Backup
     }
     Write-Host 'Creating isolated Python environment...'
-    Invoke-PythonStep $RuntimePython @('-I', '-m', 'venv', $Venv) 'Could not create the local Python environment (automation\.venv).'
+    Invoke-PythonStep $RuntimePython @('-I', '-m', 'venv', $Venv) 'Could not create the local Python environment (automation\.venv).' | Out-Null
     if (-not (Test-VenvMatches -Venv $Venv -RuntimeHome $RuntimeHome)) {
         throw 'The new Python environment (automation\.venv) does not start. Security software may block it; ask IT to allow automation\.venv.'
     }
+    Remove-OldCopies -Parent $AppDir -Filter '.venv.backup-*' -Keep 1
     return $Python
 }
 
@@ -445,20 +503,39 @@ function Test-Administrator {
     return $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Start-ProcessAndWait {
+    <# Process.Start (not Start-Process): a declined administrator prompt arrives as Win32Exception 1223 in 5.1 and 7. #>
+    param([Diagnostics.ProcessStartInfo]$StartInfo)
+    $Process = [Diagnostics.Process]::Start($StartInfo)
+    $Process.WaitForExit()
+    return [int]$Process.ExitCode
+}
+
 function Start-Installer {
     <# Returns the installer's exit code; 1223 when the administrator prompt was declined. #>
     param([string]$FilePath, [string[]]$Arguments, [switch]$Elevate)
-    $Options = @{ FilePath = $FilePath; ArgumentList = $Arguments; Wait = $true; PassThru = $true; ErrorAction = 'Stop' }
-    if ($Elevate) { $Options.Verb = 'RunAs' }
-    try { $Process = Start-Process @Options }
+    $StartInfo = New-Object Diagnostics.ProcessStartInfo
+    $StartInfo.FileName = $FilePath
+    $StartInfo.Arguments = $Arguments -join ' '
+    $StartInfo.UseShellExecute = $true
+    if ($Elevate) { $StartInfo.Verb = 'runas' }
+    try { return (Start-ProcessAndWait -StartInfo $StartInfo) }
     catch {
         $Inner = $_.Exception
         while ($null -ne $Inner.InnerException) { $Inner = $Inner.InnerException }
-        if ($Inner -is [ComponentModel.Win32Exception] -and $Inner.NativeErrorCode -eq 1223) { return 1223 }
+        if (($Inner -is [ComponentModel.Win32Exception] -and $Inner.NativeErrorCode -eq 1223) -or $Inner.Message -match 'canceled by the user') { return 1223 }
         if ($Inner -is [ComponentModel.Win32Exception]) { throw "Could not start $([IO.Path]::GetFileName($FilePath)) (Windows error $($Inner.NativeErrorCode))." }
         throw "Could not start $([IO.Path]::GetFileName($FilePath)) ($($Inner.GetType().Name))."
     }
-    return [int]$Process.ExitCode
+}
+
+function Test-InstallerBusy {
+    <# Windows Installer holds this mutex while any installation runs. #>
+    $Mutex = $null
+    try {
+        if ([Threading.Mutex]::TryOpenExisting('Global\_MSIExecute', [ref]$Mutex)) { $Mutex.Dispose(); return $true }
+    } catch { return $false }
+    return $false
 }
 
 function Test-SqlDriver {
@@ -485,6 +562,11 @@ function Install-SqlDriver {
     $MsiExec = Join-Path $env:SystemRoot 'System32/msiexec.exe'
     try {
         for ($Attempt = 1; $true; $Attempt++) {
+            # Wait before prompting, so a busy Windows Installer does not cause repeated approval prompts.
+            for ($Wait = 0; $Wait -lt 4 -and (Test-InstallerBusy); $Wait++) {
+                Write-Host 'Another installation is running (Windows Update, Intune or Software Center). Waiting 30 s before asking for approval...'
+                Start-Sleep -Seconds 30
+            }
             $Code = Start-Installer -FilePath $MsiExec -Elevate:$Elevate -Arguments @(
                 '/i', ('"{0}"' -f $Msi), '/quiet', '/norestart', 'IACCEPTMSODBCSQLLICENSETERMS=YES', '/L*v', ('"{0}"' -f $StageLog))
             if (Test-Path -LiteralPath $StageLog) { Copy-Item -LiteralPath $StageLog -Destination $Log -Force -ErrorAction SilentlyContinue }
@@ -573,34 +655,49 @@ function Test-OdbcRegistered {
     return $false
 }
 
-function Test-HostReachable {
-    <# HTTPS reachability through the same proxy as the downloads; any HTTP answer except 407 counts. #>
+function Get-SafeOrigin {
+    <# scheme://host[:port] without user names, passwords or tokens. #>
     param([string]$Url)
+    try { $Uri = [Uri]$Url; return "$($Uri.Scheme)://$($Uri.Authority)" } catch { return '(unparsable URL)' }
+}
+
+function Test-HostReachable {
+    <#
+        HEAD request through the same proxy as the real download. Only 2xx/3xx count:
+        a proxy block page (403) or a denied tunnel (5xx) is a failure. DefaultCredentials
+        is used only for downloads PowerShell makes itself; pip and Playwright cannot
+        authenticate to NTLM/Kerberos proxies, so their hosts are probed without it.
+    #>
+    param([string]$Url, [switch]$WindowsAuthentication)
     try {
         $Request = [Net.HttpWebRequest]::Create($Url)
         $Request.Method = 'HEAD'
         $Request.Timeout = 15000
-        $Request.AllowAutoRedirect = $false
+        $Request.AllowAutoRedirect = $true
         if ($env:HTTPS_PROXY) {
             $Proxy = New-Object Net.WebProxy($env:HTTPS_PROXY)
-            $Proxy.UseDefaultCredentials = $true
+            if ($WindowsAuthentication) { $Proxy.UseDefaultCredentials = $true }
             $Request.Proxy = $Proxy
+        } elseif ($WindowsAuthentication -and $null -ne $Request.Proxy) {
+            $Request.Proxy.Credentials = [Net.CredentialCache]::DefaultCredentials
         }
         $Response = $Request.GetResponse()
+        $Status = [int]$Response.StatusCode
         $Response.Close()
-        return ''
+        if ($Status -ge 200 -and $Status -lt 400) { return '' }
+        return "HTTP $Status"
     } catch {
         $Exception = $_.Exception
         while ($null -ne $Exception.InnerException -and -not ($Exception -is [Net.WebException])) { $Exception = $Exception.InnerException }
         if ($Exception -is [Net.WebException] -and $null -ne $Exception.Response) {
             $Status = [int]$Exception.Response.StatusCode
             $Exception.Response.Close()
-            if ($Status -eq 407) { return 'proxy authentication required (407)' }
-            return ''
+            if ($Status -eq 407) { return 'the proxy requires authentication (407), which pip and Playwright cannot do' }
+            return "blocked by the network or proxy (HTTP $Status)"
         }
         if ($Exception -is [Net.WebException]) {
             switch ([string]$Exception.Status) {
-                'NameResolutionFailure' { return 'name not resolved' }
+                'NameResolutionFailure' { return 'name not resolved (DNS or proxy settings)' }
                 'ProxyNameResolutionFailure' { return 'proxy name not resolved' }
                 'TrustFailure' { return 'certificate not trusted (TLS inspection?)' }
                 'SecureChannelFailure' { return 'TLS connection failed' }
@@ -613,30 +710,52 @@ function Test-HostReachable {
     }
 }
 
+function Get-PipIndexUrl {
+    <# The index pip will use: PIP_INDEX_URL, then index-url in the pip.ini files pip reads. #>
+    if ($env:PIP_INDEX_URL) { return $env:PIP_INDEX_URL }
+    $Files = @($env:PIP_CONFIG_FILE, (Join-Path ([string]$env:APPDATA) 'pip/pip.ini'), (Join-Path ([string]$env:ProgramData) 'pip/pip.ini'),
+               (Join-Path ([string]$env:USERPROFILE) 'pip/pip.ini')) | Where-Object { $_ }
+    foreach ($File in $Files) {
+        if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { continue }
+        foreach ($Line in [IO.File]::ReadAllLines($File)) {
+            if ($Line -match '^\s*index[-_]url\s*[=:]\s*(\S+)') { return $Matches[1] }
+        }
+    }
+    return ''
+}
+
 function Get-RequiredDownloads {
-    <# Hosts this run will download from, decided cheaply before anything is installed. #>
+    <# What this run will download, decided cheaply before anything is installed. #>
     param([string]$AppDir)
-    $Hosts = New-Object 'System.Collections.Generic.List[string]'
+    $Needed = New-Object 'System.Collections.Generic.List[object]'
     $Runtime = Join-Path $AppDir 'runtime/python'
-    if (-not (Test-RuntimeMarker $Runtime) -and -not (Test-PythonPackageFile (Join-Path $AppDir ('runtime/installers/' + $script:PythonPackageName)))) {
-        $Hosts.Add('https://api.nuget.org/')
+    $RuntimeReady = Test-RuntimeMarker $Runtime
+    if (-not $RuntimeReady -and -not (Test-PythonPackageFile (Join-Path $AppDir ('runtime/installers/' + $script:PythonPackageName)))) {
+        $Needed.Add([pscustomobject]@{ Name = 'Python package'; Url = $script:PythonPackageUrl; WindowsAuthentication = $true })
     }
     $Stamp = Join-Path $AppDir '.venv/requirements.sha256'
     $Recorded = ''
     if (Test-Path -LiteralPath $Stamp -PathType Leaf) { $Recorded = ([string](Get-Content -LiteralPath $Stamp -Raw)).Trim() }
-    if ($Recorded -ne (Get-RequirementsStamp (Join-Path $AppDir 'requirements.txt'))) {
-        if ($env:PIP_INDEX_URL) { $Hosts.Add(([Uri]$env:PIP_INDEX_URL).GetLeftPart([UriPartial]::Authority) + '/') }
-        else { $Hosts.Add('https://pypi.org/'); $Hosts.Add('https://files.pythonhosted.org/') }
+    # A venv that will be rebuilt (other runtime or folder) needs packages even if its stamp matches.
+    $VenvReady = $RuntimeReady -and (Test-VenvMatches -Venv (Join-Path $AppDir '.venv') -RuntimeHome $Runtime)
+    if (-not $VenvReady -or $Recorded -ne (Get-RequirementsStamp (Join-Path $AppDir 'requirements.txt'))) {
+        $Index = Get-PipIndexUrl
+        if ($Index) { $Needed.Add([pscustomobject]@{ Name = 'Python packages (configured index)'; Url = $Index; WindowsAuthentication = $false }) }
+        else {
+            $Needed.Add([pscustomobject]@{ Name = 'Python packages'; Url = 'https://pypi.org/simple/pip/'; WindowsAuthentication = $false })
+            $Needed.Add([pscustomobject]@{ Name = 'Python packages'; Url = $script:PypiProbeUrl; WindowsAuthentication = $false })
+        }
     }
-    if (-not (Test-OdbcRegistered)) { $Hosts.Add('https://go.microsoft.com/'); $Hosts.Add('https://download.microsoft.com/') }
-    $Chrome = @(Get-ChildItem -Path (Join-Path $AppDir 'browsers') -Filter 'chromium-*' -Directory -ErrorAction SilentlyContinue |
+    if (-not (Test-OdbcRegistered)) { $Needed.Add([pscustomobject]@{ Name = 'ODBC driver'; Url = $script:OdbcDriverUrl; WindowsAuthentication = $true }) }
+    $Chrome = @(Get-ChildItem -LiteralPath (Join-Path $AppDir 'browsers') -Filter 'chromium-*' -Directory -ErrorAction SilentlyContinue |
                 Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'chrome-win64/chrome.exe') })
     if ($Chrome.Count -eq 0) {
-        $Download = $env:PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST
-        if (-not $Download) { $Download = $env:PLAYWRIGHT_DOWNLOAD_HOST }
-        if ($Download) { $Hosts.Add(([Uri]$Download).GetLeftPart([UriPartial]::Authority) + '/') } else { $Hosts.Add('https://cdn.playwright.dev/') }
+        $Mirror = $env:PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST
+        if (-not $Mirror) { $Mirror = $env:PLAYWRIGHT_DOWNLOAD_HOST }
+        if ($Mirror) { $Needed.Add([pscustomobject]@{ Name = 'Chromium (configured host)'; Url = $Mirror; WindowsAuthentication = $false }) }
+        else { $Needed.Add([pscustomobject]@{ Name = 'Chromium'; Url = $script:ChromiumProbeUrl; WindowsAuthentication = $false }) }
     }
-    return @($Hosts | Select-Object -Unique)
+    return @($Needed)
 }
 
 function Test-DownloadAccess {
@@ -645,16 +764,22 @@ function Test-DownloadAccess {
     $Needed = @(Get-RequiredDownloads -AppDir $AppDir)
     if ($Needed.Count -eq 0) { return }
     $Blocked = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($Url in $Needed) {
-        $Reason = Test-HostReachable -Url $Url
-        if ($Reason) { $Blocked.Add("$(([Uri]$Url).Host): $Reason") }
+    $PythonBlocked = $false
+    foreach ($Item in $Needed) {
+        $Reason = Test-HostReachable -Url $Item.Url -WindowsAuthentication:([bool]$Item.WindowsAuthentication)
+        if ($Reason) {
+            $Blocked.Add("$(Get-SafeOrigin $Item.Url) ($($Item.Name)): $Reason")
+            if ($Item.Url -eq $script:PythonPackageUrl) { $PythonBlocked = $true }
+        }
     }
-    Write-SetupLog (@('download hosts: ' + ($Needed -join ', ')) + @($Blocked | ForEach-Object { "blocked: $_" }))
+    Write-SetupLog (@('download check: ' + (($Needed | ForEach-Object { Get-SafeOrigin $_.Url }) -join ', ')) + @($Blocked | ForEach-Object { "blocked: $_" }))
     if ($Blocked.Count -gt 0) {
         $Via = 'directly'
-        if ($env:HTTPS_PROXY) { $Via = "through the proxy $($env:HTTPS_PROXY)" }
-        throw ("Setup needs to download from hosts that cannot be reached $Via; nothing was installed:`n  - " + ($Blocked -join "`n  - ") +
-               "`nAsk IT to allow them (README.md#requirements). Offline: place $($script:PythonPackageName) in automation\runtime\installers.")
+        if ($env:HTTPS_PROXY) { $Via = "through the proxy $(Get-SafeOrigin $env:HTTPS_PROXY)" }
+        $Message = "Setup needs to download from hosts that cannot be reached $Via; nothing was installed:`n  - " + ($Blocked -join "`n  - ") +
+                   "`nAsk IT to allow them (README.md#requirements)."
+        if ($PythonBlocked) { $Message += " Offline alternative for Python: download $($script:PythonPackageUrl) and place it in automation\runtime\installers." }
+        throw $Message
     }
 }
 
@@ -665,8 +790,8 @@ function Initialize-Prerequisites {
             throw "Incomplete download: automation/$Name is missing. Extract the whole repository before running."
         }
     }
-    Assert-SetupReady -AppDir $AppDir
     Start-SetupLog -AppDir $AppDir
+    Assert-SetupReady -AppDir $AppDir
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Set-ChildEnvironment -AppDir $AppDir
     Test-DownloadAccess -AppDir $AppDir
@@ -681,7 +806,10 @@ function Initialize-Prerequisites {
         Write-Host 'Installing/verifying Python dependencies...'
         $Install = Invoke-Native -FilePath $Py -Arguments @('-I', '-m', 'pip', 'install', '--disable-pip-version-check', '--only-binary=:all:', '--progress-bar', 'off', '-r', $Requirements)
         if ($Install.ExitCode -ne 0) {
-            $Config = Invoke-Native -FilePath $Py -Arguments @('-I', '-m', 'pip', 'config', 'debug') -Quiet  # recorded in the setup log
+            $Sources = @(@($env:PIP_CONFIG_FILE, (Join-Path ([string]$env:APPDATA) 'pip/pip.ini'), (Join-Path ([string]$env:ProgramData) 'pip/pip.ini')) |
+                         Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) })
+            $Variables = @(Get-ChildItem Env: | Where-Object { $_.Name -like 'PIP_*' } | ForEach-Object { $_.Name })
+            Write-SetupLog @("pip configuration files: $($Sources -join ', ')", "pip variables set: $($Variables -join ', ')")  # names only, never values
             $Hint = Get-InstallHint $Install.Output
             $Last = @($Install.Tail | Select-Object -Last 8) -join "`n    "
             throw "Python dependencies failed to install.`n  $Hint`n  Last output:`n    $Last"

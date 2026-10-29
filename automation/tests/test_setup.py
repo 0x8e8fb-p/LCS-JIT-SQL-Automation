@@ -99,6 +99,7 @@ $script:Sleeps = 0
 $script:Staged = @()
 function Get-VerifiedInstaller {{ param($Url, $Destination, $Publisher) Set-Content -LiteralPath $Destination -Value 'msi'; return $Destination }}
 function Test-Administrator {{ return $true }}
+function Test-InstallerBusy {{ return $false }}
 function Start-Sleep {{ param($Seconds) $script:Sleeps++ }}
 function Start-Installer {{ param($FilePath, $Arguments, [switch]$Elevate) $script:Staged += $Arguments[1]; return $script:Codes.Dequeue() }}
 if (-not $env:SystemRoot) {{ $env:SystemRoot = {ps_quote(tmp_path)} }}
@@ -115,11 +116,11 @@ Write-Output ("staged-in-temp=" + (@($script:Staged | Where-Object {{ $_.Trim('"
 
 def test_declined_administrator_prompt_is_reported_as_1223(tmp_path):
     result = invoke(tmp_path, """
-function Start-Process { throw [System.ComponentModel.Win32Exception]::new(1223) }
-Write-Output ("code=" + (Start-Installer -FilePath 'msiexec.exe' -Arguments @('/i') -Elevate))
+function Start-ProcessAndWait { param($StartInfo) $script:Verb = $StartInfo.Verb; throw [System.ComponentModel.Win32Exception]::new(1223) }
+Write-Output ("code=" + (Start-Installer -FilePath 'msiexec.exe' -Arguments @('/i', '"C:\\Temp\\x y.msi"') -Elevate) + " verb=" + $script:Verb)
 """)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert 'code=1223' in result.stdout
+    assert 'code=1223 verb=runas' in result.stdout
 
 
 def test_requirements_stamp_ignores_line_endings_but_not_python(tmp_path):
@@ -144,16 +145,23 @@ def test_blocked_download_hosts_are_listed_together_before_installing(tmp_path):
         (app / name).write_text('fixture')
     result = invoke(tmp_path, f"""
 function Assert-SetupReady {{ param($AppDir) }}
-function Get-RequiredDownloads {{ param($AppDir) return @('https://pypi.org/', 'https://files.pythonhosted.org/', 'https://cdn.playwright.dev/') }}
-function Test-HostReachable {{ param($Url) if ($Url -match 'pypi|pythonhosted') {{ return 'certificate not trusted (TLS inspection?)' }}; return '' }}
+function Get-RequiredDownloads {{ param($AppDir) return @(
+    [pscustomobject]@{{ Name = 'Python packages'; Url = 'https://feed:SECRET_TOKEN@pypi.org/simple/pip/'; WindowsAuthentication = $false }},
+    [pscustomobject]@{{ Name = 'Python packages'; Url = 'https://files.pythonhosted.org/packages/x.whl'; WindowsAuthentication = $false }},
+    [pscustomobject]@{{ Name = 'Chromium'; Url = 'https://cdn.playwright.dev/builds/x.zip'; WindowsAuthentication = $false }}) }}
+function Test-HostReachable {{ param($Url, [switch]$WindowsAuthentication) if ($Url -match 'pypi|pythonhosted') {{ return 'certificate not trusted (TLS inspection?)' }}; return '' }}
 function Initialize-RuntimePython {{ throw 'installer started' }}
 try {{ Initialize-Prerequisites -AppDir {ps_quote(app)} }} catch {{ Write-Output $_.Exception.Message }}
 """)
     assert result.returncode == 0, result.stdout + result.stderr
     out = result.stdout
     assert 'cannot be reached' in out and 'nothing was installed' in out
-    assert 'pypi.org: certificate not trusted' in out and 'files.pythonhosted.org: certificate not trusted' in out
+    assert 'https://pypi.org (Python packages): certificate not trusted' in out
+    assert 'https://files.pythonhosted.org (Python packages): certificate not trusted' in out
     assert 'cdn.playwright.dev' not in out and 'installer started' not in out
+    assert 'SECRET_TOKEN' not in out and 'Offline alternative' not in out  # Python itself was not blocked
+    log = next((app / 'runtime/logs').glob('setup-*.log')).read_text(encoding='utf-8-sig')
+    assert 'SECRET_TOKEN' not in log
 
 
 @pytest.mark.parametrize('failure', ['checksum', 'unsigned', 'publisher'])
@@ -392,3 +400,50 @@ Write-Output ("python=" + (Get-Content -LiteralPath $Py -Raw).Trim())
         assert (backups[0] / 'Scripts/python.exe').read_text() == 'venv python'
     else:
         assert 'python=venv python' in result.stdout and backups == []
+
+
+def test_real_initialize_venv_returns_only_the_interpreter_path(tmp_path):
+    # Regression: a step result leaking into the pipeline turned the path into an array.
+    app = tmp_path / 'app'
+    runtime = app / 'runtime/python'
+    runtime.mkdir(parents=True)
+    result = invoke(tmp_path, f"""
+function Invoke-Native {{
+    param($FilePath, $Arguments, [switch]$Quiet)
+    if ($Arguments -contains 'venv') {{
+        $Venv = $Arguments[-1]
+        New-Item -ItemType Directory -Force -Path (Join-Path $Venv 'Scripts') | Out-Null
+        Set-Content -LiteralPath (Join-Path $Venv 'Scripts/python.exe') -Value 'venv'
+        Set-Content -LiteralPath (Join-Path $Venv 'pyvenv.cfg') -Value ("home = {runtime}`nversion = 3.13.16")
+    }}
+    return [pscustomobject]@{{ ExitCode = 0; Started = $true; Tail = @('created'); Output = 'created' }}
+}}
+$Py = Initialize-Venv -AppDir {ps_quote(app)} -RuntimePython {ps_quote(runtime / 'python.exe')}
+Write-Output ("string=" + ($Py -is [string]) + " leaf=" + (Split-Path -Leaf $Py))
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'string=True leaf=python.exe' in result.stdout
+
+
+def test_old_runtime_and_venv_copies_are_pruned(tmp_path):
+    parent = tmp_path / 'runtime'
+    for index in range(3):
+        (parent / f'python.old-{index}').mkdir(parents=True)
+        import os
+        import time
+        os.utime(parent / f'python.old-{index}', (time.time() + index, time.time() + index))
+    result = invoke(tmp_path, f"Remove-OldCopies -Parent {ps_quote(parent)} -Filter 'python.old-*' -Keep 1")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(path.name for path in parent.iterdir()) == ['python.old-2']
+
+
+def test_proxy_settings_never_reach_messages_with_credentials(tmp_path):
+    result = invoke(tmp_path, f"""
+$env:HTTPS_PROXY = 'proxy.contoso.example:8080'
+Set-ChildEnvironment -AppDir {ps_quote(tmp_path)}
+Write-Output ("normalized=" + $env:HTTPS_PROXY)
+Write-Output ("origin=" + (Get-SafeOrigin 'http://user:p4ss@proxy.contoso.example:8080'))
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'normalized=http://proxy.contoso.example:8080' in result.stdout
+    assert 'origin=http://proxy.contoso.example:8080' in result.stdout and 'p4ss' not in result.stdout

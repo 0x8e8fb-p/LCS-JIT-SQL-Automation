@@ -210,7 +210,17 @@ def test_root_run_cmd_forwards_arguments_and_exit_code(tmp_path):
     (folder / 'run.ps1').write_text('param([string]$Config, [switch]$ValidateOnly)\n'
                                     '"config=$Config validate=$ValidateOnly policy=$(Get-ExecutionPolicy -Scope Process)" | Set-Content -LiteralPath (Join-Path $PSScriptRoot "args.txt")\n'
                                     'exit 7\n', encoding='utf-8')
-    result = subprocess.run(['cmd.exe', '/d', '/c', str(folder / 'run.cmd'), '-ValidateOnly', '-Config', 'my profile & more.yaml'],
-                            cwd=tmp_path, capture_output=True, text=True, encoding='oem', errors='replace', timeout=120)
+    # cmd /s /c strips only the outer quotes; inner quotes protect the spaces and '&'.
+    line = f'cmd.exe /d /s /c ""{folder / "run.cmd"}" -ValidateOnly -Config "my profile & more.yaml""'
+    result = subprocess.run(line, cwd=tmp_path, capture_output=True, text=True, encoding='oem', errors='replace', timeout=120)
     assert result.returncode == 7, result.stdout + result.stderr
     assert (folder / 'args.txt').read_text(encoding='utf-8-sig').strip() == 'config=my profile & more.yaml validate=True policy=Bypass'
+
+
+def test_constrained_language_mode_is_explained_before_anything_runs(tmp_path):
+    wrapper = tmp_path / 'constrained.ps1'
+    wrapper.write_text("$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n& " + "'" + str(ROOT / 'run.ps1').replace("'", "''") + "' -ValidateOnly\nexit $LASTEXITCODE\n",
+                       encoding='utf-8-sig')
+    result = run_powershell(wrapper)
+    assert result.returncode == 1
+    assert 'ConstrainedLanguage mode (application control)' in result.stdout
