@@ -139,7 +139,7 @@ try {
             }
         }
         if ($NeedsLogin) {
-            Write-Host 'Complete sign-in/MFA in the browser, then press Enter in this terminal.'
+            Write-Host 'Opening a browser window for sign-in. Follow the instructions below; press Enter only when they ask for it.'
             & $Py $Main bootstrap --config $Config
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         }

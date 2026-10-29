@@ -91,12 +91,12 @@ A successful validation does not prove that the SQL server is reachable, that ev
 
 If no valid saved login exists, the launcher says why, then:
 
-1. Sign in in the browser window it opens.
+1. Sign in in the browser window it opens, not in your usual browser.
 2. Complete MFA if requested.
 3. Wait for the configured environment-details page to load.
 4. Return to the terminal and press **Enter**.
 
-The launcher then manages firewall access, requests credentials, executes the scripts, and performs cleanup. Keep the terminal and browser open until the run finishes.
+If you press Enter before the page shows, the launcher says what the browser still shows and asks again, up to three times. The launcher then manages firewall access, requests credentials, executes the scripts, and performs cleanup. Keep the terminal and browser open until the run finishes.
 
 ### 6. Check the result
 
@@ -246,6 +246,10 @@ Use an approved host and account. Local locks prevent overlapping runs within th
 | "Invalid configuration: (1) ... (2) ..." | Fix each listed problem: the URL part named, the exact reason label, non-empty details, unknown keys, and environment variables named with a `Remove-Item Env:` hint. |
 | "Cannot take the launcher lock" or "Another run is active for this environment" | Another run is still going; wait for it to finish. The lock message names other causes, such as missing permissions, a path that is too long or OneDrive locks. |
 | "No saved sign-in on this computer yet" or "belongs to a different Windows user or computer" | Expected on a new computer or account. Sign in when asked; the old files are kept as `*.stale-<UTC>`. Use the same Windows account for scheduled runs. |
+| "Sign-in did not finish: ... still shows login.microsoftonline.com, not LCS" | Sign in in the browser window the launcher opened, not in your usual browser, and press Enter once the environment page shows. If the message names an `AADSTS` code, open the linked Microsoft page; codes starting with 53 are your organization's sign-in policies, such as a required managed device, which IT can check in the Entra sign-in logs. |
+| "Sign in and open the configured environment before saving authentication" (or "the browser is not on the LCS environment page yet") right after signing in | Older versions checked the browser's address from before you signed in, so a first sign-in always failed there. Update the project (see the next row for existing clones) and run `.\run.cmd` again. |
+| `git pull` stops with "divergent branches" or "unrelated histories" | The project's Git history was rewritten on 2026-10-29. Do not merge or rebase. Save any edits to tracked files (`git status` lists them), then run `git fetch origin` and `git reset --hard origin/main`. Your `config.yaml`, saved sign-in, added SQL scripts and installed runtime are kept, because Git does not track them. |
+| "The browser window was closed before the sign-in was saved" | Keep the launcher's browser window open until the terminal shows the result, then run `.\run.cmd` again. |
 | `failed_at_step` is `auth_state_write` | Antivirus, backup software or OneDrive locked `automation/.auth`, or its permissions are wrong. Exclude the folder or move the project out of OneDrive. A sign-in file that cannot be refreshed during a normal run is only a warning; one that cannot be read stops the run. |
 | `failed_at_step` is `browser_start` | Chromium did not start: a leftover Chromium window using the profile, a missing browser (rerun `.\run.cmd`), or security software blocking `automation\browsers`. |
 | `failed_at_step` is `network` | LCS could not be reached. Check Internet, VPN and proxy access to LCS and Microsoft sign-in. |

@@ -11,20 +11,23 @@
 - Timing: fixed waits assumed the development computer's speed.
 - Sharing: every computer used the same firewall rule name for an environment.
 - Sign-in: a key from another Windows user or computer caused a sign-in loop, and locked files failed runs.
+- First sign-in: on a computer without a saved login, the sign-in always failed with "Sign in and open the configured environment before saving authentication", even when sign-in had finished before Enter was pressed (reported from a Windows test computer). Playwright's sync API applies browser events only while Python calls it. The check after Enter therefore read the address the browser had when the prompt appeared, the Microsoft sign-in page. The original computer passed because its browser was already on LCS when the prompt appeared.
 - Errors: generic messages hid the cause.
 - Tests: the suite depended on the developer's computer (personal config, pyodbc, PowerShell, Chromium).
 
-**Changes (Tasks 1–13 plus two review-fix commits, on top of the last commit of 2026-10-15):**
+**Changes (Tasks 1–13, two review-fix commits and the sign-in fix, on top of the last commit of 2026-10-15):**
 
 - Launch: root `run.cmd` starts 64-bit Windows PowerShell with `-ExecutionPolicy Bypass` for its own process; `run.ps1` removes the download mark from the launcher scripts; `.gitattributes` keeps CRLF for `.cmd`, `.bat` and `.ps1` files.
 - Setup: a preflight that lists every local blocker; a clean child environment; one download check before anything is installed; CPython 3.13.16 from the nuget.org package, verified by size and SHA-512; a venv rebuilt when the runtime or folder changes; exact pins plus `pip check`; ODBC Driver 18 installation that handles 1223, 1618, 1641 and 3010; full Chromium installed with `--no-shell`.
 - Runtime: the full Chromium with en-US and UTC in every mode; expiry parsing for other regional formats that fails closed when ambiguous; waits for LCS conditions instead of fixed delays; a per-computer default rule name; `PUBLIC_IP` in `config.yaml`; direct-first IP detection; Azure SQL connection retries and the 40615 address-mismatch message; DPAPI key rotation; atomic sign-in writes that retry locked files.
 - Errors: configuration problems listed together; diagnostics with only class names, codes and categories; new steps `browser_start`, `network` and `auth_state_write`.
+- Sign-in fix: after each Enter the browser is synchronized before anything is checked, and every tab is considered. If the window still shows sign-in, the tool names the site and any `AADSTS` error code, then asks again, up to three times, instead of failing. Enter pressed before the prompt is discarded, and a closed window is reported as such.
 - Tests and docs: a machine-independent suite with `windows`, `powershell`, `chromium` and `integration` markers; the README rewritten around `.\run.cmd`; tests that keep README anchors, links and launcher options in step with the code.
 
 **Verified on macOS arm64 (2026-10-29), not Windows:** Python 3.12.14 with the pinned runtime and development packages, PowerShell 7.6.9 (`pwsh`), Playwright Chromium build 1243.
 
-- Full suite: **214 passed, 4 skipped**. The skips are the pyodbc child-process drift probe (needs an ODBC driver manager), the two opt-in integration tests (`LCSJIT_INTEGRATION=1`) and the `cmd.exe` argument-forwarding test (Windows only). Before these changes the same macOS run had 37 passed, 3 failed, 4 skipped and 4 collection errors.
+- Full suite: **222 passed, 4 skipped**. The skips are the pyodbc child-process drift probe (needs an ODBC driver manager), the two opt-in integration tests (`LCSJIT_INTEGRATION=1`) and the `cmd.exe` argument-forwarding test (Windows only). Before these changes the same macOS run had 37 passed, 3 failed, 4 skipped and 4 collection errors.
+- The reported first-sign-in failure was reproduced with a local browser fixture: the browser is on Microsoft sign-in when the prompt appears and returns to the environment page before Enter is pressed. The 2026-10-15 code failed with the reported message, the earlier 2026-10-29 commits also failed, and the fixed code saved the sign-in. `automation/tests/test_sign_in.py` keeps this scenario and the repeated prompt.
 - mypy with `--platform win32` on the five runtime modules: clean. PowerShell parser on `run.ps1` and `automation/setup.ps1`: 0 errors. The `.ps1` and `.cmd` files are ASCII only.
 - `git archive`, which GitHub ZIP downloads are built with, produces CRLF line endings for the `.cmd` and `.ps1` files.
 - The real `python.3.13.16.nupkg` from nuget.org has 14,817,881 bytes and the SHA-512 published in the nuget.org catalog. `Expand-PythonPackage` extracted its 1,331 `tools/` files under `pwsh`; the Windows binaries were not executed.
@@ -33,11 +36,12 @@
 **Pending Windows verification:** none of these changes has run on Windows yet.
 
 1. A clean computer or Windows Sandbox with a ZIP download: `.\run.cmd`, fill in `config.yaml`, then `.\run.cmd -ValidateOnly`. Expect at most one UAC prompt (ODBC driver) and no Python entry in *Installed apps* or PATH.
-2. The development computer after `git pull`: `.\run.cmd -ValidateOnly` (the venv is rebuilt once from the nuget.org runtime), then a full `.\run.cmd`. Check `status`, `lcs_date_format` and `cleanup` in `report.json`.
-3. A computer with the English (India) or English (United Kingdom) regional format: a full run.
-4. A corporate network: proxy and certificate handling, or the blocked-host list.
-5. The test suite on Windows: `pip install -r automation\requirements-dev.txt`, `pytest automation\tests -rs`, then again with `$env:LCSJIT_INTEGRATION = '1'`.
-6. Behavior so far tested only with mocks: Windows PowerShell 5.1 itself, UAC elevation through `Process.Start` and a declined prompt (1223), the wait on the `Global\_MSIExecute` mutex, the download probes, the Windows certificate export, real DPAPI, and live LCS and SQL.
+2. The development computer after updating (see the README for clones made before 2026-10-29): `.\run.cmd -ValidateOnly` (the venv is rebuilt once from the nuget.org runtime), then a full `.\run.cmd`. Check `status`, `lcs_date_format` and `cleanup` in `report.json`.
+3. A computer without a saved sign-in: the first `.\run.cmd` signs in, saves the sign-in and continues; pressing Enter too early asks again.
+4. A computer with the English (India) or English (United Kingdom) regional format: a full run.
+5. A corporate network: proxy and certificate handling, or the blocked-host list.
+6. The test suite on Windows: `pip install -r automation\requirements-dev.txt`, `pytest automation\tests -rs`, then again with `$env:LCSJIT_INTEGRATION = '1'`.
+7. Behavior so far tested only with mocks or local fixtures: Windows PowerShell 5.1 itself, UAC elevation through `Process.Start` and a declined prompt (1223), the wait on the `Global\_MSIExecute` mutex, the download probes, the Windows certificate export, real DPAPI, a real Microsoft sign-in, and live LCS and SQL.
 
 ## Registration-free local Python installation — 2026-10-15
 

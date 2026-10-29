@@ -269,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     output = scrub(output, (os.environ.get('LCS_AUTH_KEY', ''),))
     if output.get('status') == 'failure':
         if not output.get('screenshot_path'):
-            output['screenshot_note'] = 'Browser state unavailable or safe masking failed; no unmasked image was written.'
+            output['screenshot_note'] = 'No screenshot was saved for this failure; the tool never writes an unmasked screenshot.'
         if logs_path is not None:
             save_diagnostics(logs_path, args.command, output)
     encoded = json.dumps(output, indent=2, allow_nan=False)

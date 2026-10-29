@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta, timezone
 import uuid
@@ -47,6 +47,8 @@ def collapse(value: str) -> str:
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 NO_SIGN_IN = 'No saved sign-in on this computer yet. Run .\\run.cmd and complete sign-in when asked (or .\\run.cmd -LaunchOnly to sign in only).'
 SIGN_IN_AGAIN = 'Sign in again: run .\\run.cmd and complete sign-in when asked.'
+SIGN_IN_WINDOW_CLOSED = ('The browser window was closed before the sign-in was saved. Run .\\run.cmd again and keep that window open '
+                         'until this terminal shows the result.')
 
 
 class DpapiError(Exception):
@@ -245,12 +247,35 @@ def load_auth(path: Path, key_path: Path | None = None) -> StorageState:
         raise AutomationError('authentication', f'The saved sign-in file is damaged. {SIGN_IN_AGAIN}') from None
 
 
+def _discard_typed_ahead() -> None:
+    """Drop keys pressed before the prompt, such as Enter pressed while the sign-in check ran."""
+    try:
+        if sys.platform == 'win32':
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass  # Best effort: an unusual console only loses this convenience.
+
+
+def _is_console(stream: Any) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 def wait_for_enter(prompt: str) -> None:
     """The interactive sign-in pause; refuses consoles that cannot answer."""
-    print(prompt, file=sys.stderr)
     try:
         if sys.stdin is None:
             raise EOFError
+        if _is_console(sys.stdin):
+            _discard_typed_ahead()
+        print(prompt, file=sys.stderr)
         input()
     except (EOFError, RuntimeError, OSError):
         raise AutomationError('authentication', 'Sign-in needs an interactive console. Run run.cmd from PowerShell or Windows Terminal once; '
@@ -300,6 +325,7 @@ class LCSAutomation:
     CREDENTIAL_POLL_INTERVAL_SECONDS = 10
     CREDENTIAL_POLL_SECONDS = 180    # the request is submitted once, then only polled
     SIGN_IN_GRACE_MS = 10000         # silent single sign-on hops through login pages and back
+    SIGN_IN_PROMPTS = 3              # Enter presses accepted while the browser still shows sign-in
 
     def __init__(self, config: Config, playwright: Playwright, log_dir: Path, *, bootstrap: bool = False, headed: bool = False):
         self.config = config
@@ -660,39 +686,146 @@ class LCSAutomation:
             return
         raise AutomationError('authentication', 'Sign-in did not complete after three attempts. Run .\\run.cmd -ForceInteractive; Entra MFA/Conditional Access cannot be bypassed.')
 
+    def _sync_browser(self) -> None:
+        """Bring page.url and context.pages up to date after Python waited at a prompt.
+
+        Playwright's sync API delivers browser events only during a Playwright call, so
+        after input() both still describe the browser as it was when the prompt appeared:
+        a completed sign-in still looked like the Microsoft sign-in page.
+        """
+        try:
+            # A data-free round trip (no cookie matches this URL) delivers queued navigation and new-tab events.
+            self.context.cookies('https://sync.invalid/')
+        except BrowserError:
+            raise AutomationError('authentication', SIGN_IN_WINDOW_CLOSED) from None
+        open_pages = [page for page in self.context.pages if not page.is_closed()]
+        if not open_pages:
+            raise AutomationError('authentication', SIGN_IN_WINDOW_CLOSED)
+        if self.page.is_closed():
+            self.page = open_pages[-1]
+        self.page = self._active_lcs_page()
+
+    def _shown_site(self) -> str:
+        """The host the current tab shows, for messages."""
+        from urllib.parse import urlsplit
+        parsed = urlsplit(self.page.url)
+        if parsed.scheme not in {'http', 'https'}:
+            return 'an empty page'
+        host = (parsed.hostname or '').lower()
+        return host if re.fullmatch(r'[a-z0-9.-]{1,100}', host) else 'another site'
+
+    def _wait_for_lcs_tab(self) -> str | None:
+        """None once a tab of this browser shows the configured LCS host; otherwise the site shown.
+
+        A redirect still in flight (no sign-in form visible) gets the sign-in grace period to arrive.
+        """
+        from urllib.parse import urlsplit
+        expected = (urlsplit(self.config.lcs_origin).hostname or '').lower()
+        deadline = time.monotonic() + self.SIGN_IN_GRACE_MS / 1000
+        while True:
+            self._sync_browser()
+            parsed = urlsplit(self.page.url)
+            if parsed.scheme == 'https' and (parsed.hostname or '').lower() == expected:
+                return None
+            problem = self._landing_problem()
+            if problem is not None and problem.step == 'environment':
+                raise problem  # Another LCS host: signing in again cannot help.
+            if self._sign_in_prompt_visible() or time.monotonic() >= deadline:
+                return self._shown_site()
+            try:
+                self.page.wait_for_timeout(250)
+            except BrowserError:
+                pass  # That tab closed; the next sync picks another one or reports the closed window.
+
+    def _sign_in_error_hint(self) -> str:
+        """The AADSTS number of a Microsoft sign-in error page; nothing else of the page is kept."""
+        if self._sign_in_prompt_visible():
+            return ''
+        try:
+            text = self.page.locator('body').text_content(timeout=2000) or ''
+        except BrowserError:
+            return ''
+        match = re.search(r'AADSTS(\d{5,7})', text)
+        if not match:
+            return ''
+        code = match.group(1)
+        cause = (' Codes starting with 53 are your organization\'s sign-in policies (such as Conditional Access); IT can see the exact '
+                 'reason in the Microsoft Entra sign-in logs.' if code.startswith('53') else '')
+        return f' Microsoft sign-in shows error AADSTS{code} (https://login.microsoftonline.com/error?code={code}).{cause}'
+
+    def _lcs_after_enter(self, target_url: str) -> str | None:
+        """None when LCS shows after Enter (continued to target_url); otherwise the site shown instead."""
+        shown = self._wait_for_lcs_tab()
+        if shown is None:
+            try:
+                self._complete_lcs_landing(target_url)  # The LCS sign-in page or dashboard: continue to the target.
+            except BrowserError:
+                pass  # A slow or interrupted load: the checks below decide.
+            shown = self._wait_for_lcs_tab()  # Loading the target can still end at sign-in.
+        return shown
+
+    def _await_interactive_sign_in(self, target_url: str, page_name: str, ready: Callable[[], None]) -> None:
+        """Ask for Enter until the page is ready, at most SIGN_IN_PROMPTS times.
+
+        Each Enter is checked against what the browser shows now. While it still shows
+        sign-in, the user is told so and asked again instead of the run failing.
+        """
+        prompt = f'Sign in and complete MFA in the browser window this tool opened. When {page_name} shows, press Enter here.'
+        for attempt in range(1, self.SIGN_IN_PROMPTS + 1):
+            wait_for_enter(prompt)
+            shown = self._lcs_after_enter(target_url)
+            if shown is None:
+                try:
+                    ready()
+                    return
+                except AutomationError as problem:
+                    if problem.step != 'authentication' or self._on_lcs():
+                        raise
+                    shown = self._shown_site()  # LCS sent the browser to sign-in (again).
+            hint = self._sign_in_error_hint()
+            if attempt == self.SIGN_IN_PROMPTS:
+                raise AutomationError('authentication', f'Sign-in did not finish: after {attempt} presses of Enter, the browser window this tool '
+                                      f'opened still shows {shown}, not LCS. Run .\\run.cmd again, sign in in the window it opens (not in '
+                                      f'another browser), and press Enter once {page_name} shows.{hint}')
+            prompt = (f'The browser window this tool opened shows {shown}, not LCS. Finish signing in there (not in another browser); '
+                      f'when {page_name} shows, press Enter again.{hint}')
+
+    def _environment_ready(self) -> None:
+        try:
+            if not self._wait_for_section(self.locator('accounts')):
+                raise self._slow_section('The environment page (Database accounts section)')
+            self.page.locator('h1').wait_for(state='visible', timeout=self.NAVIGATION_TIMEOUT_MS)
+        except BrowserError:
+            raise self._slow_section('The environment page heading') from None
+
+    def _project_ready(self) -> None:
+        if not self.page.url.startswith(f'{self.config.lcs_origin}/V2/Project/{self.config.project_id}'):
+            raise AutomationError('authentication', 'Open the configured LCS project before saving authentication.')
+        self.locator('environment_link').wait_for(state='visible', timeout=self.NAVIGATION_TIMEOUT_MS)
+
     def bootstrap(self, *, navigate_first: bool = True) -> None:
         origin_url = self.config.lcs_origin
         target_url = self.config.environment_url or f'{origin_url}/V2/Project/{self.config.project_id}/'
         if navigate_first:
-            self.page.goto(target_url, wait_until='domcontentloaded', timeout=self.NAVIGATION_TIMEOUT_MS)
-        if self.config.environment_url:
-            wait_for_enter('Complete sign-in and MFA; wait for the environment page to load, then press Enter here.')
-            self._complete_lcs_landing(target_url)
-            if not self.page.url.startswith(origin_url + '/'):
-                problem = self._landing_problem()
-                if problem is not None and problem.step == 'environment':
-                    raise problem
-                raise AutomationError('authentication', 'Sign-in did not finish: the browser is not on the LCS environment page yet. '
-                                      'Complete sign-in, wait until the environment page shows, then press Enter.')
             try:
-                if not self._wait_for_section(self.locator('accounts')):
-                    raise self._slow_section('The environment page (Database accounts section)')
-                self.page.locator('h1').wait_for(state='visible', timeout=self.NAVIGATION_TIMEOUT_MS)
-            except BrowserError:
-                raise self._slow_section('The environment page heading') from None
-            except AutomationError as problem:
-                if problem.step != 'authentication':
-                    raise
-                raise AutomationError('authentication', 'Sign-in did not finish: the browser left LCS. Complete sign-in, wait until the '
-                                      'environment page shows, then press Enter.') from None
+                self.page.goto(target_url, wait_until='domcontentloaded', timeout=self.NAVIGATION_TIMEOUT_MS)
+            except BrowserError as error:
+                category = browser_category(error) or 'other'
+                if category == 'browser_closed':
+                    raise AutomationError('authentication', SIGN_IN_WINDOW_CLOSED) from None
+                if category == 'timeout' and not self.page.url.startswith(('http://', 'https://')):
+                    category = 'net::ERR_TIMED_OUT'  # Nothing loaded at all: LCS is unreachable.
+                if category.startswith('net::ERR_') and category != 'net::ERR_ABORTED':
+                    host = origin_url.split('//', 1)[-1]
+                    raise AutomationError('network', f'LCS could not be reached ({category}). Check Internet, VPN and proxy access to {host} '
+                                          'and Microsoft sign-in.') from None
+                # Slow or interrupted: the window stays open, and the checks after Enter decide.
+        if self.config.environment_url:
+            self._await_interactive_sign_in(target_url, 'the environment page', self._environment_ready)
             self.verify_environment()
             self.wait_idle()
         else:
-            wait_for_enter('Complete sign-in and MFA in the browser; open the project, then press Enter here.')
-            self._complete_lcs_landing(target_url)
-            if not self.page.url.startswith(f'{origin_url}/V2/Project/{self.config.project_id}'):
-                raise AutomationError('authentication', 'Open the configured LCS project before saving authentication.')
-            self.locator('environment_link').wait_for(state='visible', timeout=self.NAVIGATION_TIMEOUT_MS)
+            self._await_interactive_sign_in(target_url, 'the LCS project', self._project_ready)
             self.wait_idle()
         # Bootstrap exists to save the sign-in, so a failed save is an error here.
         self.auth_reset = save_auth(self.context, self.config.state_path, self.config.auth_key_path) or self.auth_reset
