@@ -70,3 +70,91 @@ def test_environment_lock_identity_does_not_change_with_heading(tmp_path):
         with pytest.raises(AutomationError, match='Another run'):
             with environment_lock(after_navigation):
                 pytest.fail('Heading discovery changed the environment lock')
+
+
+SECRET = 'PLANTED_SECRET_9f3a'
+
+
+def test_all_independent_problems_are_reported_together(tmp_path, monkeypatch):
+    monkeypatch.setenv('LOGS_PATH', SECRET)
+    path = profile(tmp_path, ENVIRONMENT_URL=f'https://lcs.dynamics.com/V2/Project/123?token={SECRET}',
+                   ACCESS_DETAILS='', ACCESS_REASON='Something else')
+    with pytest.raises(AutomationError) as raised:
+        Config.load(path)
+    message = raised.value.message
+    assert message.startswith('Invalid configuration: ')
+    assert 'environment-details page' in message
+    assert 'EnvironmentId' in message
+    assert 'ACCESS_DETAILS is empty' in message
+    assert 'ACCESS_REASON must be exactly one of' in message and 'AX troubleshooting (read-only to AX)' in message
+    assert 'environment variable(s) LOGS_PATH' in message and 'Remove-Item Env:LOGS_PATH' in message
+    assert SECRET not in message
+    assert message.endswith('See README.md#configuration.')
+
+
+def test_unknown_and_duplicate_keys_are_named_without_values(tmp_path):
+    path = profile(tmp_path, SQL_PASSWORD=SECRET)
+    with pytest.raises(AutomationError, match='unknown setting.*SQL_PASSWORD') as raised:
+        Config.load(path)
+    assert SECRET not in raised.value.message
+    path.write_text(path.read_text(encoding='utf-8') + f'ACCESS_DETAILS: "{SECRET}"\n', encoding='utf-8')
+    with pytest.raises(AutomationError, match='duplicate key ACCESS_DETAILS on line') as raised:
+        Config.load(path)
+    assert SECRET not in raised.value.message
+
+
+def test_yaml_errors_report_position_only(tmp_path):
+    path = tmp_path / 'config.yaml'
+    path.write_text(f'ENVIRONMENT_URL: "https://lcs.dynamics.com\nACCESS_DETAILS: "{SECRET}\n', encoding='utf-8')
+    with pytest.raises(AutomationError, match=r'not valid YAML near line \d+, column \d+') as raised:
+        Config.load(path)
+    assert SECRET not in raised.value.message
+
+
+@pytest.mark.parametrize(('encoding', 'phrase'), [('utf-16', 'saved as UTF-16'), ('cp1252', 'is not UTF-8 text')])
+def test_non_utf8_config_is_named(tmp_path, encoding, phrase):
+    path = tmp_path / 'config.yaml'
+    text = (f'ENVIRONMENT_URL: "{URL}"\nACCESS_REASON: "AX troubleshooting (read-only to AX)"\n'
+            'ACCESS_DETAILS: "Approved caf\u00e9 validation"\nFIREWALL_RULE_NAME: "validation"\n')
+    path.write_bytes(text.encode(encoding))
+    with pytest.raises(AutomationError, match=phrase):
+        Config.load(path)
+    path.write_bytes(text.encode('utf-8'))
+    assert Config.load(path).details == 'Approved caf\u00e9 validation'
+
+
+@pytest.mark.parametrize(('content', 'phrase'), [
+    ('SELECT 1;'.encode('utf-16'), 'SQL script 02_unicode.sql is saved as UTF-16'),
+    ('SELECT \'caf\u00e9\';'.encode('cp1252'), 'SQL script 02_unicode.sql is not UTF-8 text'),
+    (b'SELECT 1;\nGO 5\n', 'SQL script 02_unicode.sql: GO repetition'),
+    (b'  \n', 'SQL script 02_unicode.sql is empty'),
+])
+def test_sql_script_problems_name_the_file(tmp_path, content, phrase):
+    import sql_executor
+    folder = tmp_path / 'sql'
+    folder.mkdir()
+    (folder / '01_ok.sql').write_text('SELECT 1;', encoding='utf-8')
+    (folder / '02_unicode.sql').write_bytes(content)
+    with pytest.raises(AutomationError, match=phrase) as raised:
+        sql_executor.validate_scripts(folder)
+    assert raised.value.step == 'configuration'
+    with pytest.raises(AutomationError, match=phrase):
+        sql_executor.prepare_scripts(folder)
+
+
+def test_missing_or_empty_scripts_folder_is_named(tmp_path):
+    import sql_executor
+    with pytest.raises(AutomationError, match='folder missing_folder does not exist'):
+        sql_executor.validate_scripts(tmp_path / 'missing_folder')
+    (tmp_path / 'empty').mkdir()
+    with pytest.raises(AutomationError, match='folder empty contains no .sql files'):
+        sql_executor.validate_scripts(tmp_path / 'empty')
+
+
+def test_fresh_template_lists_what_to_fill_in(tmp_path):
+    path = tmp_path / 'config.yaml'
+    path.write_bytes((ROOT / 'automation/config.template.yaml').read_bytes())
+    with pytest.raises(AutomationError) as raised:
+        Config.load(path)
+    assert 'ENVIRONMENT_URL is empty' in raised.value.message
+    assert 'ACCESS_DETAILS is empty' in raised.value.message

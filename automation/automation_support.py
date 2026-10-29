@@ -18,12 +18,24 @@ import uuid
 import yaml
 
 
+class ConfigProblem(ValueError):
+    """One author-written, secret-free configuration problem (never a raw value)."""
+
+
+def printable_key(key: object) -> str:
+    text = str(key)
+    return text if re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', text) else '(unprintable key)'
+
+
 class UniqueKeyLoader(yaml.SafeLoader):
     """YAML duplicate keys are errors, not silent last-value-wins overrides."""
     def construct_mapping(self, node: yaml.nodes.MappingNode, deep: bool = False) -> dict[Any, Any]:
-        keys = [self.construct_object(key, deep=deep) for key, _ in node.value]
-        if len(set(keys)) != len(keys):
-            raise ValueError('Duplicate YAML key')
+        seen: set[Any] = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise ConfigProblem(f'duplicate key {printable_key(key)} on line {key_node.start_mark.line + 1} (keep only one)')
+            seen.add(key)
         return dict(super().construct_mapping(node, deep=deep))
 
 
@@ -288,170 +300,289 @@ class Config:
 
     @classmethod
     def load(cls, path: Path, *, bootstrap: bool = False) -> Config:
+        """Load and validate a profile, reporting every independent problem at once."""
         try:
-            raw = yaml.load(path.read_text(encoding='utf-8-sig'), Loader=UniqueKeyLoader)
-            if not isinstance(raw, dict):
-                raise ValueError('mapping required')
-            data: dict[str, Any] = {key: value.strip() if isinstance(value, str) else value for key, value in raw.items()}
-            minimal_keys = {'ENVIRONMENT_URL', 'ACCESS_REASON', 'ACCESS_DETAILS', 'FIREWALL_RULE_NAME'}
-            minimal = 'selectors' not in data
-            if minimal:
-                if set(data) - minimal_keys or any(key in os.environ for key in ENV_KEYS - minimal_keys):
-                    raise ValueError('Advanced settings require an explicit selectors profile; remove stale environment overrides')
-            for key in ENV_KEYS:
-                if key in os.environ:
-                    data[key] = os.environ[key].strip()
-            # URL-only profiles receive internal defaults; explicit legacy profiles
-            # with selectors keep their existing behavior for calibrated overrides.
-            if data.get('ENVIRONMENT_URL') and 'selectors' not in data:
-                if 'FIREWALL_RULE_NAME' not in data:
-                    raise ValueError('FIREWALL_RULE_NAME is required in the minimal profile')
-                defaults = yaml.safe_load(Path(__file__).with_name('defaults.yaml').read_text(encoding='utf-8'))
-                data = {**defaults, **data}
-            if data.get('ENVIRONMENT_URL'):
-                target = urlsplit(str(data['ENVIRONMENT_URL']))
-                match = re.fullmatch(r'/V2/EnvironmentDetailsV3New/(\d+)', target.path)
-                ids = parse_qs(target.query, keep_blank_values=True).get('EnvironmentId', [])
-                if target.scheme != 'https' or target.netloc not in LCS_HOSTS or target.fragment or not match or len(ids) != 1:
-                    raise ValueError('Paste a complete HTTPS LCS environment-details URL')
-                try:
-                    canonical_id = str(uuid.UUID(ids[0])).lower()
-                except ValueError:
-                    raise ValueError('EnvironmentId must be a valid GUID') from None
-                if ids[0].lower() != canonical_id or ids[0] != canonical_id:
-                    raise ValueError('EnvironmentId must be a canonical lowercase GUID')
-                derived_project = match.group(1)
-                if 'LCS_PROJECT_ID' in data and data['LCS_PROJECT_ID'] != derived_project:
-                    raise ValueError('LCS_PROJECT_ID conflicts with ENVIRONMENT_URL')
+            return cls._load(path, bootstrap)
+        except ConfigProblems as problems:
+            items = problems.items
+            listed = items[0] if len(items) == 1 else ' '.join(f'({number}) {item};' for number, item in enumerate(items, 1)).rstrip(';')
+            raise AutomationError('configuration', f'Invalid configuration: {listed}. See README.md#configuration.') from None
+        except ConfigProblem as problem:
+            raise AutomationError('configuration', f'Invalid configuration: {problem}. See README.md#configuration.') from None
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            # Raw parser/OS errors may quote secret-bearing config lines; never show them.
+            raise AutomationError('configuration', 'Invalid configuration. Paste a complete HTTPS LCS environment URL, an exact supported ACCESS_REASON, non-empty ACCESS_DETAILS, and a valid FIREWALL_RULE_NAME. Remove duplicate YAML keys/stale advanced environment overrides. See README.md#configuration for the fields and README.md#advanced-profiles for profiles.') from None
+
+    @classmethod
+    def _load(cls, path: Path, bootstrap: bool) -> Config:
+        name = safe_file_name(path)
+        raw = read_profile(path)
+        problems: list[str] = []
+        data: dict[str, Any] = {}
+        for key, value in raw.items():
+            if not isinstance(key, str):
+                problems.append(f'setting names must be text ({printable_key(key)} is not)')
+                continue
+            data[key] = value.strip() if isinstance(value, str) else value
+        minimal = 'selectors' not in data
+        if minimal:
+            unknown = sorted(printable_key(key) for key in set(data) - MINIMAL_KEYS)
+            if unknown:
+                problems.append(f'unknown setting(s) {", ".join(unknown)} in {name} (config.yaml accepts only '
+                                f'{", ".join(sorted(MINIMAL_KEYS))}, advanced settings need a profile with selectors: README.md#advanced-profiles)')
+            conflicting = sorted(key for key in ENV_KEYS - MINIMAL_KEYS if key in os.environ)
+            if conflicting:
+                removal = '; '.join(f'Remove-Item Env:{key}' for key in conflicting)
+                problems.append(f'environment variable(s) {", ".join(conflicting)} would override config.yaml (Windows matches names in any letter case), remove them '
+                                f'for this window with {removal} and permanently in System Properties > Environment Variables')
+            overrides = MINIMAL_KEYS
+        else:
+            unknown = sorted(printable_key(key) for key in data if key not in ENV_KEYS | {'selectors'})
+            if unknown:
+                problems.append(f'unknown setting(s) {", ".join(unknown)} (check spelling against automation/config.advanced.yaml)')
+            overrides = ENV_KEYS
+        for key in overrides:
+            if key in os.environ:
+                data[key] = os.environ[key].strip()
+        if minimal:
+            if 'FIREWALL_RULE_NAME' not in data:
+                problems.append('FIREWALL_RULE_NAME is missing')
+            defaults = yaml.safe_load(Path(__file__).with_name('defaults.yaml').read_text(encoding='utf-8'))
+            data = {**defaults, **data}
+
+        def text(key: str, default: str = '') -> str:
+            value = data.get(key, default)
+            if value is None:
+                return ''
+            if not isinstance(value, str):
+                problems.append(f'{key} must be a quoted text value')
+                return default
+            return value.strip()
+
+        def boolean(key: str, default: bool) -> bool:
+            value = data.get(key, default)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value.lower() in {'true', 'false'}:
+                return value.lower() == 'true'
+            problems.append(f'{key} must be true or false')
+            return default
+
+        def positive(key: str, default: int, maximum: int) -> int:
+            value = data.get(key, default)
+            try:
+                if isinstance(value, bool):
+                    raise ValueError('boolean')
+                number = int(value)
+                if str(number) != str(value).strip() or not 1 <= number <= maximum:
+                    raise ValueError('range')
+                return number
+            except (TypeError, ValueError):
+                problems.append(f'{key} must be a whole number between 1 and {maximum}')
+                return default
+
+        environment_url = text('ENVIRONMENT_URL')
+        url_valid = False
+        if environment_url:
+            url_problems, derived_project, environment_guid = check_environment_url(environment_url)
+            problems.extend(url_problems)
+            if not url_problems:
+                url_valid = True
+                if 'LCS_PROJECT_ID' in data and str(data['LCS_PROJECT_ID']).strip() != derived_project:
+                    problems.append('LCS_PROJECT_ID does not match the project number in ENVIRONMENT_URL')
                 data['LCS_PROJECT_ID'] = derived_project
                 # Heading is read from this verified URL when no name was supplied.
                 data.setdefault('ENVIRONMENT_ID', '')
-                identity = hashlib.sha256(f'{derived_project}:{ids[0]}'.encode()).hexdigest()[:24]
+                identity = hashlib.sha256(f'{derived_project}:{environment_guid}'.encode()).hexdigest()[:24]
                 data.setdefault('STORAGE_STATE_PATH', str(Path(__file__).parent / '.auth' / f'{identity}.enc'))
                 if os.name == 'nt':
                     data.setdefault('AUTH_KEY_PATH', str(Path(__file__).parent / '.auth' / f'{identity}.dpapi'))
                 data.setdefault('LOGS_PATH', str(Path(__file__).parent / 'logs'))
-            if 'ACCESS_LEVEL' not in data:
-                levels = {
-                    'AX troubleshooting (read-only to AX)': 'read_only',
-                    'MR troubleshooting (read-only to MR)': 'read_only',
-                    'Performance tuning for AX (write to AX)': 'read_write',
-                    'Troubleshooting and tuning entity store (write to AXDW)': 'read_write',
-                }
-                if data.get('ACCESS_REASON') not in levels:
-                    raise ValueError('Unknown reason; an advanced profile must declare ACCESS_LEVEL')
-                data['ACCESS_LEVEL'] = levels[data['ACCESS_REASON']]
-            def text(key: str, default: str = '') -> str:
-                value = data.get(key, default)
-                if not isinstance(value, str):
-                    raise ValueError(f'{key} must be a quoted string')
-                return value.strip()
-            def boolean(key: str, default: bool) -> bool:
-                value = data.get(key, default)
-                if isinstance(value, bool):
-                    return value
-                if isinstance(value, str) and value.lower() in {'true', 'false'}:
-                    return value.lower() == 'true'
-                raise ValueError(f'{key} must be true or false')
-            def positive(key: str, default: int, maximum: int) -> int:
-                value = data.get(key, default)
-                if isinstance(value, bool):
-                    raise ValueError(f'{key} must be an integer')
-                number = int(value)
-                if str(number) != str(value) or not 1 <= number <= maximum:
-                    raise ValueError(f'{key} must be between 1 and {maximum}')
-                return number
-            base = path.resolve().parent
-            def local_path(key: str, default: str) -> Path:
-                return (base / text(key, default)).resolve()
-            project = text('LCS_PROJECT_ID')
-            if not project.isdigit():
-                raise ValueError('LCS_PROJECT_ID must be numeric')
-            environment = text('ENVIRONMENT_ID')
-            if not environment and not text('ENVIRONMENT_URL'):
-                raise ValueError('ENVIRONMENT_URL or ENVIRONMENT_ID is required')
-            level = text('ACCESS_LEVEL', 'read_only')
-            if level not in {'read_only', 'read_write'}:
-                raise ValueError('ACCESS_LEVEL must be read_only or read_write')
-            reason, details = text('ACCESS_REASON'), text('ACCESS_DETAILS')
-            if not bootstrap and (not reason or reason.startswith('REPLACE_') or not details):
-                raise ValueError('Set ACCESS_REASON to the exact tenant option label and provide ACCESS_DETAILS')
-            selectors = data.get('selectors', {})
-            if not isinstance(selectors, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in selectors.items()):
-                raise ValueError('selectors must map strings to CSS selector strings')
-            known_keys = ENV_KEYS | {'selectors'}
-            if any(key not in known_keys for key in data):
-                raise ValueError('Unknown configuration key; check spelling')
-            if reason in {'AX troubleshooting (read-only to AX)', 'MR troubleshooting (read-only to MR)'} and level != 'read_only':
-                raise ValueError('The selected LCS reason requires ACCESS_LEVEL read_only')
-            if reason in {'Performance tuning for AX (write to AX)', 'Troubleshooting and tuning entity store (write to AXDW)'} and level != 'read_write':
-                raise ValueError('The selected LCS reason requires ACCESS_LEVEL read_write')
-            selector_keys = {
-                'environment_link', 'maintain', 'enable_access', 'enable_dialog', 'ip_address',
-                'enable_submit', 'accounts', 'reason', 'reason_list', 'details', 'request_access',
-                'rows', 'server_database', 'username', 'password', 'password_reveal', 'expires_at',
-                'expiry_format', 'row_reason', 'row_details', 'disable_access', 'disable_dialog',
-                'disable_ip_address', 'disable_submit', 'rule_name', 'rule_grid', 'rule_add',
-                'rule_delete', 'rule_close', 'rule_add_dialog', 'rule_confirm',
-            }
-            if any(key not in selector_keys for key in selectors):
-                raise ValueError('Unknown selector key; check spelling')
-            selectors = {key: value.strip() for key, value in selectors.items()}
-            if 'FIREWALL_RULE_NAME' in data:
-                rule_name = text('FIREWALL_RULE_NAME')
-                if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', rule_name):
-                    raise ValueError('FIREWALL_RULE_NAME requires 1-64 letters, digits, underscores or hyphens')
-                selectors['rule_name'] = rule_name
-            if selectors.get('expiry_format', '') not in {'', 'iso8601', 'lcs_utc'}:
-                raise ValueError('expiry_format must be iso8601 or lcs_utc')
-            disable = boolean('DISABLE_ACCESS_AFTER', True)
-            required = ['accounts', 'rows', 'server_database', 'username', 'password', 'expires_at']
-            if disable and not selectors.get('rule_grid'):
-                required.append('disable_ip_address')
-            if selectors.get('rule_grid'):
-                required += ['enable_dialog', 'rule_add', 'rule_close', 'rule_add_dialog', 'rule_confirm']
-                if disable:
-                    required.append('rule_delete')
-            if not bootstrap and any(not selectors.get(k) for k in required):
-                raise ValueError('Calibrate required selectors: ' + ', '.join(required))
-            ip = text('PUBLIC_IP')
-            if ip:
+        reason = text('ACCESS_REASON')
+        details = text('ACCESS_DETAILS')
+        level = text('ACCESS_LEVEL') if 'ACCESS_LEVEL' in data else SUPPORTED_REASONS.get(reason, '')
+        reason_labels = '; '.join(f'"{label}"' for label in SUPPORTED_REASONS)
+        if not reason or reason.startswith('REPLACE_'):
+            if not bootstrap:
+                problems.append(f'ACCESS_REASON is empty or a placeholder, set it to the exact LCS reason, one of: {reason_labels}')
+        elif 'ACCESS_LEVEL' not in data and reason not in SUPPORTED_REASONS:
+            problems.append(f'ACCESS_REASON must be exactly one of the LCS reasons: {reason_labels}')
+        base = path.resolve().parent
+
+        def local_path(key: str, default: str) -> Path:
+            return (base / (text(key, default) or default)).resolve()
+
+        project = text('LCS_PROJECT_ID')
+        environment = text('ENVIRONMENT_ID')
+        if not environment_url and not environment:
+            problems.append('ENVIRONMENT_URL is empty (paste the complete LCS environment-details URL from the browser address bar, it contains EnvironmentId=)')
+        elif not url_valid and not environment_url and not project.isdigit():
+            problems.append('LCS_PROJECT_ID must be the numeric LCS project ID')
+        if ('ACCESS_LEVEL' in data or level) and level not in {'read_only', 'read_write'}:
+            problems.append('ACCESS_LEVEL must be read_only or read_write')
+        if not bootstrap and not details:
+            problems.append('ACCESS_DETAILS is empty (enter the approved justification for the LCS request)')
+        raw_selectors = data.get('selectors', {})
+        selectors: dict[str, str] = {}
+        if not isinstance(raw_selectors, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in raw_selectors.items()):
+            problems.append('selectors must map names to quoted CSS selector text')
+        else:
+            unknown_selectors = sorted(printable_key(key) for key in raw_selectors if key not in SELECTOR_KEYS)
+            if unknown_selectors:
+                problems.append(f'unknown selector(s) {", ".join(unknown_selectors)} (check spelling)')
+            selectors = {key: value.strip() for key, value in raw_selectors.items()}
+        if reason in READ_ONLY_REASONS and level and level != 'read_only':
+            problems.append('the selected ACCESS_REASON grants read-only access, so ACCESS_LEVEL must be read_only')
+        if reason in READ_WRITE_REASONS and level and level != 'read_write':
+            problems.append('the selected ACCESS_REASON grants write access, so ACCESS_LEVEL must be read_write')
+        if 'FIREWALL_RULE_NAME' in data:
+            rule_name = text('FIREWALL_RULE_NAME')
+            if not RULE_NAME.fullmatch(rule_name):
+                problems.append('FIREWALL_RULE_NAME must be 1-64 letters, digits, underscores or hyphens, starting with a letter or digit')
+            selectors['rule_name'] = rule_name
+        if selectors.get('expiry_format', '') not in {'', 'iso8601', 'lcs_utc'}:
+            problems.append('selectors.expiry_format must be iso8601 or lcs_utc')
+        disable = boolean('DISABLE_ACCESS_AFTER', True)
+        required = ['accounts', 'rows', 'server_database', 'username', 'password', 'expires_at']
+        if disable and not selectors.get('rule_grid'):
+            required.append('disable_ip_address')
+        if selectors.get('rule_grid'):
+            required += ['enable_dialog', 'rule_add', 'rule_close', 'rule_add_dialog', 'rule_confirm']
+            if disable:
+                required.append('rule_delete')
+        missing = [key for key in required if not selectors.get(key)]
+        if not bootstrap and missing:
+            problems.append('calibrate the required selector(s) ' + ', '.join(missing))
+        ip = text('PUBLIC_IP')
+        if ip:
+            try:
                 address = ipaddress.ip_address(ip)
                 if not isinstance(address, ipaddress.IPv4Address) or not address.is_global:
-                    raise ValueError('PUBLIC_IP must be a global IPv4 address')
-            suffix = text('SQL_DNS_SUFFIX', 'database.windows.net')
-            if not re.fullmatch(r'[A-Za-z0-9]+(?:\.[A-Za-z0-9-]+)+', suffix):
-                raise ValueError('SQL_DNS_SUFFIX must be a DNS suffix')
-            environment_url = text('ENVIRONMENT_URL')
-            if environment_url:
-                target = urlsplit(environment_url)
-                if target.scheme != 'https' or target.netloc not in LCS_HOSTS or target.path != f'/V2/EnvironmentDetailsV3New/{project}' or not parse_qs(target.query).get('EnvironmentId'):
-                    raise ValueError('ENVIRONMENT_URL must target the configured LCS project')
-            timezone = text('BROWSER_TIMEZONE', 'UTC')
-            if timezone != 'UTC':
-                raise ValueError('Only verified UTC browser timezone is currently supported')
-            try:
-                import pyodbc
-                installed = list(pyodbc.drivers())
-            except Exception:
-                installed = [] # A broken pyodbc is reported by check_runtime, not as a config error.
-            auto_driver = next((name for name in ('ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server') if name in installed), 'ODBC Driver 18 for SQL Server')
-            driver = text('SQL_ODBC_DRIVER', auto_driver)
-            if driver not in {'ODBC Driver 17 for SQL Server', 'ODBC Driver 18 for SQL Server'}:
-                raise ValueError('Only Microsoft ODBC Drivers 17/18 are supported')
-            state_path = local_path('STORAGE_STATE_PATH', './.auth/lcs_auth.enc')
-            key_path = local_path('AUTH_KEY_PATH', '') if text('AUTH_KEY_PATH') else None
-            if key_path == state_path:
-                raise ValueError('AUTH_KEY_PATH and STORAGE_STATE_PATH must be different files')
-            return cls(project, environment, level, reason, details,
-                       local_path('SQL_SCRIPTS_PATH', './sql_scripts'),
-                       state_path,
-                       local_path('LOGS_PATH', './logs'),
-                       boolean('CONTINUE_ON_ERROR', False), disable, ip, suffix,
-                       positive('SQL_TIMEOUT_SECONDS', 60, 3600),
-                       positive('MAX_RESULT_ROWS', 100, 10000), dict(selectors),
-                       environment_url, timezone, driver,
-                       key_path, minimal)
-        except (OSError, ValueError, TypeError, yaml.YAMLError):
-            # YAML/parser errors may quote secret-bearing config lines.
-            raise AutomationError('configuration', 'Invalid configuration. Paste a complete HTTPS LCS environment URL, an exact supported ACCESS_REASON, non-empty ACCESS_DETAILS, and a valid FIREWALL_RULE_NAME. Remove duplicate YAML keys/stale advanced environment overrides. See README.md#configuration for the fields and README.md#advanced-profiles for profiles.') from None
+                    raise ValueError('not global IPv4')
+            except ValueError:
+                problems.append('PUBLIC_IP must be the public IPv4 address your SQL traffic leaves from, such as 203.0.113.10')
+        suffix = text('SQL_DNS_SUFFIX', 'database.windows.net') or 'database.windows.net'
+        if not re.fullmatch(r'[A-Za-z0-9]+(?:\.[A-Za-z0-9-]+)+', suffix):
+            problems.append('SQL_DNS_SUFFIX must be a DNS suffix such as database.windows.net')
+        if environment_url and url_valid and urlsplit(environment_url).path != f'/V2/EnvironmentDetailsV3New/{project}':
+            problems.append('ENVIRONMENT_URL must target the configured LCS project')
+        timezone_name = text('BROWSER_TIMEZONE', 'UTC') or 'UTC'
+        if timezone_name != 'UTC':
+            problems.append('BROWSER_TIMEZONE must be UTC (the only verified setting)')
+        try:
+            import pyodbc
+            installed = list(pyodbc.drivers())
+        except Exception:
+            installed = [] # A broken pyodbc is reported by check_runtime, not as a config error.
+        auto_driver = next((driver_name for driver_name in SUPPORTED_DRIVERS if driver_name in installed), SUPPORTED_DRIVERS[0])
+        driver = text('SQL_ODBC_DRIVER', auto_driver) or auto_driver
+        if driver not in SUPPORTED_DRIVERS:
+            problems.append('SQL_ODBC_DRIVER must be "ODBC Driver 18 for SQL Server" or "ODBC Driver 17 for SQL Server"')
+        state_path = local_path('STORAGE_STATE_PATH', './.auth/lcs_auth.enc')
+        key_path = local_path('AUTH_KEY_PATH', '') if text('AUTH_KEY_PATH') else None
+        if key_path == state_path:
+            problems.append('AUTH_KEY_PATH and STORAGE_STATE_PATH must be different files')
+        continue_on_error = boolean('CONTINUE_ON_ERROR', False)
+        sql_timeout = positive('SQL_TIMEOUT_SECONDS', 60, 3600)
+        max_rows = positive('MAX_RESULT_ROWS', 100, 10000)
+        if problems:
+            raise ConfigProblems(list(dict.fromkeys(problems)))
+        return cls(project, environment, level or 'read_only', reason, details,
+                   local_path('SQL_SCRIPTS_PATH', './sql_scripts'),
+                   state_path,
+                   local_path('LOGS_PATH', './logs'),
+                   continue_on_error, disable, ip, suffix, sql_timeout, max_rows, dict(selectors),
+                   environment_url, timezone_name, driver,
+                   key_path, minimal)
+
+
+class ConfigProblems(ValueError):
+    def __init__(self, items: list[str]):
+        super().__init__('; '.join(items))
+        self.items = items
+
+
+MINIMAL_KEYS = {'ENVIRONMENT_URL', 'ACCESS_REASON', 'ACCESS_DETAILS', 'FIREWALL_RULE_NAME'}
+SUPPORTED_REASONS = {
+    'AX troubleshooting (read-only to AX)': 'read_only',
+    'MR troubleshooting (read-only to MR)': 'read_only',
+    'Performance tuning for AX (write to AX)': 'read_write',
+    'Troubleshooting and tuning entity store (write to AXDW)': 'read_write',
+}
+READ_ONLY_REASONS = {label for label, level in SUPPORTED_REASONS.items() if level == 'read_only'}
+READ_WRITE_REASONS = {label for label, level in SUPPORTED_REASONS.items() if level == 'read_write'}
+SUPPORTED_DRIVERS = ('ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server')
+RULE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
+SELECTOR_KEYS = {
+    'environment_link', 'maintain', 'enable_access', 'enable_dialog', 'ip_address',
+    'enable_submit', 'accounts', 'reason', 'reason_list', 'details', 'request_access',
+    'rows', 'server_database', 'username', 'password', 'password_reveal', 'expires_at',
+    'expiry_format', 'row_reason', 'row_details', 'disable_access', 'disable_dialog',
+    'disable_ip_address', 'disable_submit', 'rule_name', 'rule_grid', 'rule_add',
+    'rule_delete', 'rule_close', 'rule_add_dialog', 'rule_confirm',
+}
+
+
+def read_profile(path: Path) -> dict[Any, Any]:
+    """Read a YAML mapping; file-level problems are fatal and described safely."""
+    name = safe_file_name(path)
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        raise ConfigProblem(f'{name} was not found') from None
+    except OSError as error:
+        code = getattr(error, 'winerror', None) or error.errno or 'unknown'
+        raise ConfigProblem(f'{name} cannot be read (error {code}): check permissions and that it is not locked or still syncing') from None
+    if content.startswith((b'\xff\xfe', b'\xfe\xff')):
+        raise ConfigProblem(f'{name} is saved as UTF-16, save it as UTF-8 (Notepad: Save as > Encoding: UTF-8)')
+    try:
+        decoded = content.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        raise ConfigProblem(f'{name} is not UTF-8 text, save it as UTF-8 (Notepad: Save as > Encoding: UTF-8)') from None
+    try:
+        raw = yaml.load(decoded, Loader=UniqueKeyLoader)
+    except yaml.MarkedYAMLError as error:
+        mark = error.problem_mark or error.context_mark
+        where = f' near line {mark.line + 1}, column {mark.column + 1}' if mark is not None else ''
+        raise ConfigProblem(f'{name} is not valid YAML{where} (check quotes, colons and indentation)') from None
+    except yaml.YAMLError:
+        raise ConfigProblem(f'{name} is not valid YAML (check quotes, colons and indentation)') from None
+    if not isinstance(raw, dict):
+        raise ConfigProblem(f'{name} must contain "KEY: value" lines such as ENVIRONMENT_URL: "https://..."')
+    return raw
+
+
+def check_environment_url(url: str) -> tuple[list[str], str, str]:
+    """Problems with an LCS environment-details URL, plus its project and GUID."""
+    problems: list[str] = []
+    try:
+        target = urlsplit(url)
+    except ValueError:
+        return ['ENVIRONMENT_URL is not a valid URL; copy it from the browser address bar'], '', ''
+    if target.scheme != 'https':
+        problems.append('ENVIRONMENT_URL must start with https://')
+    if target.netloc not in LCS_HOSTS:
+        host = target.hostname or ''
+        shown = f' ({host})' if re.fullmatch(r'[A-Za-z0-9.-]{1,100}', host) else ''
+        problems.append(f'ENVIRONMENT_URL host{shown} is not an LCS host (use lcs.dynamics.com or your regional LCS host such as eu.lcs.dynamics.com)')
+    match = re.fullmatch(r'/V2/EnvironmentDetailsV3New/(\d+)', target.path)
+    if not match:
+        problems.append('ENVIRONMENT_URL must be the environment-details page (/V2/EnvironmentDetailsV3New/<project number>), not the project or application URL')
+    if target.fragment:
+        problems.append('ENVIRONMENT_URL must not contain a #fragment')
+    ids = parse_qs(target.query, keep_blank_values=True).get('EnvironmentId', [])
+    guid = ''
+    if not ids:
+        problems.append('ENVIRONMENT_URL is missing ?EnvironmentId=<GUID> (copy the complete address)')
+    elif len(ids) > 1:
+        problems.append('ENVIRONMENT_URL contains EnvironmentId more than once')
+    else:
+        try:
+            canonical = str(uuid.UUID(ids[0])).lower()
+        except ValueError:
+            problems.append('EnvironmentId in ENVIRONMENT_URL is not a valid GUID')
+        else:
+            if ids[0] != canonical:
+                problems.append('EnvironmentId must be the lowercase GUID with hyphens exactly as LCS shows it')
+            guid = canonical
+    return problems, match.group(1) if match else '', guid

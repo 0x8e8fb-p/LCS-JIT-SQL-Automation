@@ -13,7 +13,7 @@ try:
 except ImportError:  # Reported clearly by check_runtime / execute_sql_scripts when SQL is needed.
     pyodbc = None  # type: ignore[assignment]
 
-from automation_support import AutomationError, Config, Credentials, timestamp, utcnow
+from automation_support import AutomationError, Config, Credentials, safe_file_name, timestamp, utcnow
 
 
 def split_batches(sql: str) -> list[str]:
@@ -91,15 +91,46 @@ def connection_string(credentials: Credentials, driver: str = 'ODBC Driver 18 fo
 
 
 def discover_scripts(path: Path) -> list[Path]:
+    folder = safe_file_name(path)
     try:
         if not path.is_dir():
-            raise OSError('directory missing')
+            raise AutomationError('configuration', f'The SQL scripts folder {folder} does not exist. Create it and put the reviewed .sql files directly inside it.')
         files = sorted((p for p in path.iterdir() if p.is_file() and p.suffix.lower() == '.sql'), key=lambda p: p.name)
-        if not files:
-            raise OSError('no files')
-        return files
-    except OSError:
-        raise AutomationError('configuration', 'SQL_SCRIPTS_PATH must be a readable folder containing .sql files.') from None
+    except OSError as error:
+        code = getattr(error, 'winerror', None) or error.errno or 'unknown'
+        raise AutomationError('configuration', f'The SQL scripts folder {folder} cannot be read (error {code}). Check its permissions.') from None
+    if not files:
+        raise AutomationError('configuration', f'The SQL scripts folder {folder} contains no .sql files. Only top-level .sql files are run; subfolders are ignored.')
+    return files
+
+
+def read_script(file: Path) -> str:
+    """UTF-8 (with or without BOM) SQL text; other encodings are named, not guessed."""
+    name = safe_file_name(file)
+    try:
+        content = file.read_bytes()
+    except OSError as error:
+        code = getattr(error, 'winerror', None) or error.errno or 'unknown'
+        raise AutomationError('configuration', f'Cannot read SQL script {name} (error {code}). Check its permissions and that it is not locked or still syncing.') from None
+    if content.startswith((b'\xff\xfe', b'\xfe\xff')):
+        raise AutomationError('configuration', f'SQL script {name} is saved as UTF-16 ("Unicode" in SSMS/Notepad). Save it as UTF-8 and rerun.')
+    try:
+        return content.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        raise AutomationError('configuration', f'SQL script {name} is not UTF-8 text (probably ANSI). Save it as UTF-8 and rerun.') from None
+
+
+def script_batches(file: Path) -> tuple[str, ...]:
+    name = safe_file_name(file)
+    try:
+        batches = tuple(split_batches(read_script(file)))
+    except AutomationError as error:
+        if error.message.startswith(('Cannot read SQL script', 'SQL script')):
+            raise
+        raise AutomationError('configuration', f'SQL script {name}: {error.message}') from None
+    if not batches:
+        raise AutomationError('configuration', f'SQL script {name} is empty. Supply non-empty plain T-SQL or remove the file.')
+    return batches
 
 
 @dataclass(frozen=True)
@@ -110,27 +141,14 @@ class PreparedScript:
 
 def prepare_scripts(path: Path) -> list[PreparedScript]:
     """Snapshot reviewed batches before any grant; do not reread files afterward."""
-    prepared = []
-    for file in validate_scripts(path):
-        try:
-            batches = tuple(split_batches(file.read_text(encoding='utf-8-sig')))
-        except (OSError, UnicodeError):
-            raise AutomationError('configuration', 'Cannot snapshot SQL scripts. Check permissions and UTF-8 encoding.') from None
-        if not batches:
-            raise AutomationError('configuration', 'A SQL script became empty before execution; no access was requested.')
-        prepared.append(PreparedScript(file.name, batches))
-    return prepared
+    return [PreparedScript(file.name, script_batches(file)) for file in discover_scripts(path)]
 
 
 def validate_scripts(path: Path) -> list[Path]:
     """Reject unreadable/unsupported/empty scripts before granting any access."""
     files = discover_scripts(path)
     for file in files:
-        try:
-            if not split_batches(file.read_text(encoding='utf-8-sig')):
-                raise AutomationError('configuration', 'A SQL script is empty. Supply non-empty UTF-8 plain T-SQL files.')
-        except (OSError, UnicodeError):
-            raise AutomationError('configuration', 'Cannot read all SQL scripts. Check permissions and UTF-8 encoding before requesting access.') from None
+        script_batches(file)
     return files
 
 
