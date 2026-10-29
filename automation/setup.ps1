@@ -17,6 +17,9 @@ $script:DeepestProfilePath = 180
 $script:MaxPath = 259
 $script:MinimumFreeBytes = 1.5GB
 $script:SetupLog = $null
+$script:SetupChecks = Join-Path $PSScriptRoot 'setup_checks.py'
+# Microsoft's stable link to the current ODBC Driver 18 for SQL Server x64 MSI (18.7.1.1 when verified).
+$script:OdbcDriverUrl = 'https://go.microsoft.com/fwlink/?linkid=2378279'
 
 function Write-SetupLog {
     param([string[]]$Lines)
@@ -427,70 +430,237 @@ function Get-VerifiedInstaller {
     $Signature = Get-AuthenticodeSignature -LiteralPath $Destination
     if ($Signature.Status -ne 'Valid' -or $null -eq $Signature.SignerCertificate -or
         $Signature.SignerCertificate.Subject -notmatch $Publisher) {
+        $Status = [string]$Signature.Status
+        $Detail = ''
+        if ($Signature.PSObject.Properties['StatusMessage'] -and $Signature.StatusMessage) { $Detail = " ($($Signature.StatusMessage))" }
         Remove-Item -LiteralPath $Destination -Force
-        throw 'Installer signature/publisher verification failed. Nothing was installed.'
+        throw "Installer signature/publisher verification failed: status $Status$Detail. Nothing was installed. If Windows cannot check certificates (offline or blocked revocation checks), ask IT to install the driver."
     }
     return $Destination
 }
 
-function Invoke-SetupProcess {
-    param([string]$Executable, [string[]]$Arguments, [switch]$Elevate, [string]$LogPath)
-    $Options = @{ FilePath = $Executable; ArgumentList = $Arguments; Wait = $true; PassThru = $true }
+function Test-Administrator {
+    $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+    return $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Start-Installer {
+    <# Returns the installer's exit code; 1223 when the administrator prompt was declined. #>
+    param([string]$FilePath, [string[]]$Arguments, [switch]$Elevate)
+    $Options = @{ FilePath = $FilePath; ArgumentList = $Arguments; Wait = $true; PassThru = $true; ErrorAction = 'Stop' }
     if ($Elevate) { $Options.Verb = 'RunAs' }
-    $Process = Start-Process @Options
-    if ($Process.ExitCode -eq 3010 -or $Process.ExitCode -eq 1641) {
-        throw "Installation requires a restart. Restart Windows and rerun .\run.cmd. Log: $LogPath"
+    try { $Process = Start-Process @Options }
+    catch {
+        $Inner = $_.Exception
+        while ($null -ne $Inner.InnerException) { $Inner = $Inner.InnerException }
+        if ($Inner -is [ComponentModel.Win32Exception] -and $Inner.NativeErrorCode -eq 1223) { return 1223 }
+        if ($Inner -is [ComponentModel.Win32Exception]) { throw "Could not start $([IO.Path]::GetFileName($FilePath)) (Windows error $($Inner.NativeErrorCode))." }
+        throw "Could not start $([IO.Path]::GetFileName($FilePath)) ($($Inner.GetType().Name))."
     }
-    if ($Process.ExitCode -ne 0) { throw "Installer failed (exit $($Process.ExitCode)). Log: $LogPath" }
+    return [int]$Process.ExitCode
 }
 
 function Test-SqlDriver {
     param([string]$Python)
-    $Result = Invoke-Native -FilePath $Python -Arguments @('-I', '-c', 'import pyodbc, sys; sys.exit(0 if any(d in pyodbc.drivers() for d in (''ODBC Driver 18 for SQL Server'', ''ODBC Driver 17 for SQL Server'')) else 1)') -Quiet
-    return ($Result.ExitCode -eq 0)
+    $Checks = $script:SetupChecks
+    return ((Invoke-Native -FilePath $Python -Arguments @('-I', $Checks, 'odbc') -Quiet).ExitCode -eq 0)
 }
 
 function Install-SqlDriver {
     param([string]$AppDir)
     $Cache = Join-Path $AppDir 'runtime/installers'
-    Write-Host 'Installing Microsoft ODBC Driver 18. Windows may ask for administrator approval.'
-    # 18.7 includes the C++ runtime; no separate redistributable is required.
-    $Installer = Get-VerifiedInstaller -Url 'https://go.microsoft.com/fwlink/?linkid=2378279' `
-        -Destination (Join-Path $Cache 'msodbcsql18.msi') -Publisher 'O=Microsoft Corporation(?:,|$)'
+    Write-Host 'Installing Microsoft ODBC Driver 18 for SQL Server (x64). Windows asks for administrator approval.'
+    # 18.7 and later include the C++ runtime; no separate redistributable is required.
+    $Installer = Get-VerifiedInstaller -Url $script:OdbcDriverUrl -Destination (Join-Path $Cache 'msodbcsql18.msi') -Publisher 'O=Microsoft Corporation(?:,|$)'
+    # An elevated msiexec can run as another account (over-the-shoulder approval) that cannot
+    # read this folder, OneDrive or a mapped drive: stage the package and log in the user's temp.
+    $Stage = Join-Path ([IO.Path]::GetTempPath()) ('lcsjit-odbc-' + (New-ShortId))
+    [IO.Directory]::CreateDirectory($Stage) | Out-Null
+    $Msi = Join-Path $Stage 'msodbcsql18.msi'
+    $StageLog = Join-Path $Stage 'odbc-install.log'
     $Log = Join-Path $Cache 'odbc-install.log'
-    $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
-    $Admin = $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    Invoke-SetupProcess -Executable (Join-Path $env:SystemRoot 'System32/msiexec.exe') -Elevate:(-not $Admin) -LogPath $Log -Arguments @(
-        '/i', ('"{0}"' -f $Installer), '/quiet', '/norestart', 'IACCEPTMSODBCSQLLICENSETERMS=YES',
-        '/L*v', ('"{0}"' -f $Log)
-    )
+    Copy-Item -LiteralPath $Installer -Destination $Msi
+    $Elevate = -not (Test-Administrator)
+    $MsiExec = Join-Path $env:SystemRoot 'System32/msiexec.exe'
+    try {
+        for ($Attempt = 1; $true; $Attempt++) {
+            $Code = Start-Installer -FilePath $MsiExec -Elevate:$Elevate -Arguments @(
+                '/i', ('"{0}"' -f $Msi), '/quiet', '/norestart', 'IACCEPTMSODBCSQLLICENSETERMS=YES', '/L*v', ('"{0}"' -f $StageLog))
+            if (Test-Path -LiteralPath $StageLog) { Copy-Item -LiteralPath $StageLog -Destination $Log -Force -ErrorAction SilentlyContinue }
+            Write-SetupLog @("ODBC installer attempt $Attempt exit $Code")
+            if ($Code -eq 0) { return }
+            if ($Code -eq 3010) { Write-Host 'ODBC Driver 18 is installed. Windows recommends a restart later; this run can continue.'; return }
+            if ($Code -eq 1641) { throw 'The ODBC driver installer restarted Windows or requires a restart now. Restart, then rerun .\run.cmd.' }
+            if ($Code -eq 1223) { throw 'Installing the ODBC driver needs administrator approval and the Windows prompt was declined. Ask IT to install Microsoft ODBC Driver 18 for SQL Server (x64), then rerun .\run.cmd.' }
+            if ($Code -eq 1618) {
+                if ($Attempt -le 4) { Write-Host 'Another installation is running (Windows Update, Intune or Software Center). Waiting 30 s...'; Start-Sleep -Seconds 30; continue }
+                throw 'Another installation kept running for about 2 minutes, so the ODBC driver could not be installed. Let it finish, then rerun .\run.cmd.'
+            }
+            throw "The ODBC driver installer failed (exit $Code). Log: $Log"
+        }
+    } finally {
+        Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-PythonStep {
-    param([string]$Python, [string[]]$Arguments, [string]$Failure)
+    param([string]$Python, [string[]]$Arguments, [string]$Failure, [string]$Hint = '')
     $Result = Invoke-Native -FilePath $Python -Arguments $Arguments
     if ($Result.ExitCode -ne 0) {
         $Last = @($Result.Tail | Select-Object -Last 8) -join "`n    "
-        throw "$Failure`n  Last output:`n    $Last"
+        $Advice = ''
+        if ($Hint) { $Advice = "`n  $Hint" }
+        throw "$Failure$Advice`n  Last output:`n    $Last"
     }
+    return $Result
+}
+
+function Get-InstallHint {
+    <# A likely cause for a failed pip or Playwright download, from its output. #>
+    param([string]$Output)
+    if ($Output -match 'CERTIFICATE_VERIFY_FAILED|certificate verify failed|self[- ]signed certificate|unable to get local issuer|SSLError') {
+        return 'The network replaces certificates (TLS inspection). Windows root certificates are used; ask IT to install the inspection root certificate, or set PIP_CERT / NODE_EXTRA_CA_CERTS to its PEM file.'
+    }
+    if ($Output -match '407|Proxy Authentication Required') {
+        return 'The proxy requires authentication, which pip and Playwright cannot do. Ask IT for a proxy exception for the hosts listed in README.md#requirements.'
+    }
+    if ($Output -match 'No matching distribution|from versions: none') {
+        return 'pip could not find the pinned packages. PIP_INDEX_URL or pip.ini may point to a mirror without them; see automation\runtime\logs for the pip configuration.'
+    }
+    if ($Output -match 'Long Path|long path|path too long|\[Errno 2\] No such file or directory') {
+        return 'A path became too long. Move the project to a shorter folder such as C:\LCSJIT, or ask IT to enable Win32 long paths.'
+    }
+    if ($Output -match 'getaddrinfo|Name or service not known|ENOTFOUND|NewConnectionError|ECONNREFUSED|timed out') {
+        return 'The download host could not be reached. Check Internet, VPN and proxy access (README.md#requirements).'
+    }
+    if ($Output -match 'EPERM|EBUSY|Access is denied|being used by another process') {
+        return 'A file was locked, often by antivirus or OneDrive. Retry, or exclude the project folder from scanning and syncing.'
+    }
+    return ''
+}
+
+function Get-RequirementsStamp {
+    <# Line endings never matter (CRLF checkouts); the Python version does. #>
+    param([string]$Requirements)
+    $Text = [IO.File]::ReadAllText($Requirements) -replace "`r`n", "`n"
+    $Bytes = [Text.Encoding]::UTF8.GetBytes($Text + "`npython=" + $script:PythonVersion)
+    $Sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($Sha.ComputeHash($Bytes))).Replace('-', '') } finally { $Sha.Dispose() }
 }
 
 function Test-PythonPackages {
     param([string]$Python, [string]$Requirements)
-    $Result = Invoke-Native -FilePath $Python -Arguments @('-c', 'import playwright.sync_api, pyodbc, yaml, cryptography.fernet; import sys; from importlib.metadata import version; from pathlib import Path; lines=Path(sys.argv[1]).read_text().splitlines(); pins=[line.strip().split(''=='') for line in lines if line.strip() and not line.lstrip().startswith(''#'')]; sys.exit(0 if all(len(p)==2 and version(p[0])==p[1] for p in pins) else 1)', $Requirements) -Quiet
+    $Checks = $script:SetupChecks
+    $Result = Invoke-Native -FilePath $Python -Arguments @('-I', $Checks, 'packages', $Requirements) -Quiet
+    if ($Result.ExitCode -ne 0) { Write-SetupLog @("package check: $($Result.Output)") }
     return ($Result.ExitCode -eq 0)
 }
 
 function Test-Chromium {
     param([string]$Python)
-    $Result = Invoke-Native -FilePath $Python -Arguments @('-c', 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); b.close(); p.stop()') -Quiet
-    return ($Result.ExitCode -eq 0)
+    $Checks = $script:SetupChecks
+    return ((Invoke-Native -FilePath $Python -Arguments @('-I', $Checks, 'chromium') -Quiet).ExitCode -eq 0)
+}
+
+function Test-OdbcRegistered {
+    try {
+        $Drivers = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers' -ErrorAction Stop
+        foreach ($Name in @('ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server')) {
+            if ($Drivers.PSObject.Properties[$Name]) { return $true }
+        }
+    } catch { return $false }
+    return $false
+}
+
+function Test-HostReachable {
+    <# HTTPS reachability through the same proxy as the downloads; any HTTP answer except 407 counts. #>
+    param([string]$Url)
+    try {
+        $Request = [Net.HttpWebRequest]::Create($Url)
+        $Request.Method = 'HEAD'
+        $Request.Timeout = 15000
+        $Request.AllowAutoRedirect = $false
+        if ($env:HTTPS_PROXY) {
+            $Proxy = New-Object Net.WebProxy($env:HTTPS_PROXY)
+            $Proxy.UseDefaultCredentials = $true
+            $Request.Proxy = $Proxy
+        }
+        $Response = $Request.GetResponse()
+        $Response.Close()
+        return ''
+    } catch {
+        $Exception = $_.Exception
+        while ($null -ne $Exception.InnerException -and -not ($Exception -is [Net.WebException])) { $Exception = $Exception.InnerException }
+        if ($Exception -is [Net.WebException] -and $null -ne $Exception.Response) {
+            $Status = [int]$Exception.Response.StatusCode
+            $Exception.Response.Close()
+            if ($Status -eq 407) { return 'proxy authentication required (407)' }
+            return ''
+        }
+        if ($Exception -is [Net.WebException]) {
+            switch ([string]$Exception.Status) {
+                'NameResolutionFailure' { return 'name not resolved' }
+                'ProxyNameResolutionFailure' { return 'proxy name not resolved' }
+                'TrustFailure' { return 'certificate not trusted (TLS inspection?)' }
+                'SecureChannelFailure' { return 'TLS connection failed' }
+                'Timeout' { return 'timed out' }
+                'ConnectFailure' { return 'connection refused or blocked' }
+            }
+            return [string]$Exception.Status
+        }
+        return $Exception.GetType().Name
+    }
+}
+
+function Get-RequiredDownloads {
+    <# Hosts this run will download from, decided cheaply before anything is installed. #>
+    param([string]$AppDir)
+    $Hosts = New-Object 'System.Collections.Generic.List[string]'
+    $Runtime = Join-Path $AppDir 'runtime/python'
+    if (-not (Test-RuntimeMarker $Runtime) -and -not (Test-PythonPackageFile (Join-Path $AppDir ('runtime/installers/' + $script:PythonPackageName)))) {
+        $Hosts.Add('https://api.nuget.org/')
+    }
+    $Stamp = Join-Path $AppDir '.venv/requirements.sha256'
+    $Recorded = ''
+    if (Test-Path -LiteralPath $Stamp -PathType Leaf) { $Recorded = ([string](Get-Content -LiteralPath $Stamp -Raw)).Trim() }
+    if ($Recorded -ne (Get-RequirementsStamp (Join-Path $AppDir 'requirements.txt'))) {
+        if ($env:PIP_INDEX_URL) { $Hosts.Add(([Uri]$env:PIP_INDEX_URL).GetLeftPart([UriPartial]::Authority) + '/') }
+        else { $Hosts.Add('https://pypi.org/'); $Hosts.Add('https://files.pythonhosted.org/') }
+    }
+    if (-not (Test-OdbcRegistered)) { $Hosts.Add('https://go.microsoft.com/'); $Hosts.Add('https://download.microsoft.com/') }
+    $Chrome = @(Get-ChildItem -Path (Join-Path $AppDir 'browsers') -Filter 'chromium-*' -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'chrome-win64/chrome.exe') })
+    if ($Chrome.Count -eq 0) {
+        $Download = $env:PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST
+        if (-not $Download) { $Download = $env:PLAYWRIGHT_DOWNLOAD_HOST }
+        if ($Download) { $Hosts.Add(([Uri]$Download).GetLeftPart([UriPartial]::Authority) + '/') } else { $Hosts.Add('https://cdn.playwright.dev/') }
+    }
+    return @($Hosts | Select-Object -Unique)
+}
+
+function Test-DownloadAccess {
+    <# Lists every unreachable download host in one message before any installation starts. #>
+    param([string]$AppDir)
+    $Needed = @(Get-RequiredDownloads -AppDir $AppDir)
+    if ($Needed.Count -eq 0) { return }
+    $Blocked = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($Url in $Needed) {
+        $Reason = Test-HostReachable -Url $Url
+        if ($Reason) { $Blocked.Add("$(([Uri]$Url).Host): $Reason") }
+    }
+    Write-SetupLog (@('download hosts: ' + ($Needed -join ', ')) + @($Blocked | ForEach-Object { "blocked: $_" }))
+    if ($Blocked.Count -gt 0) {
+        $Via = 'directly'
+        if ($env:HTTPS_PROXY) { $Via = "through the proxy $($env:HTTPS_PROXY)" }
+        throw ("Setup needs to download from hosts that cannot be reached $Via; nothing was installed:`n  - " + ($Blocked -join "`n  - ") +
+               "`nAsk IT to allow them (README.md#requirements). Offline: place $($script:PythonPackageName) in automation\runtime\installers.")
+    }
 }
 
 function Initialize-Prerequisites {
     param([string]$AppDir)
-    foreach ($Name in @('main.py', 'automation_support.py', 'lcs_jit_automation.py', 'sql_executor.py', 'requirements.txt', 'defaults.yaml')) {
+    foreach ($Name in @('main.py', 'automation_support.py', 'lcs_jit_automation.py', 'sql_executor.py', 'setup_checks.py', 'requirements.txt', 'defaults.yaml')) {
         if (-not (Test-Path -LiteralPath (Join-Path $AppDir $Name) -PathType Leaf)) {
             throw "Incomplete download: automation/$Name is missing. Extract the whole repository before running."
         }
@@ -499,30 +669,40 @@ function Initialize-Prerequisites {
     Start-SetupLog -AppDir $AppDir
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Set-ChildEnvironment -AppDir $AppDir
+    Test-DownloadAccess -AppDir $AppDir
     $RuntimePython = Initialize-RuntimePython -AppDir $AppDir
     $Py = Initialize-Venv -AppDir $AppDir -RuntimePython $RuntimePython
     $Requirements = Join-Path $AppDir 'requirements.txt'
     $Stamp = Join-Path $AppDir '.venv/requirements.sha256'
-    $Hash = (Get-FileHash -LiteralPath $Requirements -Algorithm SHA256).Hash
+    $Expected = Get-RequirementsStamp $Requirements
     $Recorded = ''
-    if (Test-Path -LiteralPath $Stamp -PathType Leaf) { $Recorded = [string](Get-Content -LiteralPath $Stamp -Raw) }
-    if ($Recorded.Trim() -ne $Hash -or
-        -not (Test-PythonPackages $Py $Requirements)) {
+    if (Test-Path -LiteralPath $Stamp -PathType Leaf) { $Recorded = ([string](Get-Content -LiteralPath $Stamp -Raw)).Trim() }
+    if ($Recorded -ne $Expected -or -not (Test-PythonPackages $Py $Requirements)) {
         Write-Host 'Installing/verifying Python dependencies...'
-        Invoke-PythonStep $Py @('-m', 'pip', 'install', '--disable-pip-version-check', '--only-binary=:all:', '-r', $Requirements) 'Python dependencies failed to install. Check Internet/proxy access and automation/requirements.txt.'
-        if (-not (Test-PythonPackages $Py $Requirements)) { throw 'Installed Python dependencies could not be imported.' }
-        Set-Content -LiteralPath $Stamp -Value $Hash -Encoding ASCII
+        $Install = Invoke-Native -FilePath $Py -Arguments @('-I', '-m', 'pip', 'install', '--disable-pip-version-check', '--only-binary=:all:', '--progress-bar', 'off', '-r', $Requirements)
+        if ($Install.ExitCode -ne 0) {
+            $Config = Invoke-Native -FilePath $Py -Arguments @('-I', '-m', 'pip', 'config', 'debug') -Quiet  # recorded in the setup log
+            $Hint = Get-InstallHint $Install.Output
+            $Last = @($Install.Tail | Select-Object -Last 8) -join "`n    "
+            throw "Python dependencies failed to install.`n  $Hint`n  Last output:`n    $Last"
+        }
+        if (-not (Test-PythonPackages $Py $Requirements)) { throw 'Installed Python dependencies do not match automation\requirements.txt; see automation\runtime\logs for the first mismatch.' }
+        Set-Content -LiteralPath $Stamp -Value $Expected -Encoding ASCII
     }
     # Check repeat runs too; imports alone do not establish compatibility.
-    Invoke-PythonStep $Py @('-m', 'pip', 'check') 'Python dependency compatibility check failed. Repair the project-local environment before running.'
+    Invoke-PythonStep $Py @('-I', '-m', 'pip', 'check') 'Python dependency compatibility check failed. Repair the project-local environment before running.' | Out-Null
     if (-not (Test-SqlDriver $Py)) {
         Install-SqlDriver $AppDir
-        if (-not (Test-SqlDriver $Py)) { throw 'ODBC driver still unavailable. Review automation/runtime/installers/odbc-install.log and rerun after any required restart.' }
+        if (-not (Test-SqlDriver $Py)) { throw 'ODBC driver still unavailable. Review automation\runtime\installers\odbc-install.log and rerun after any required restart.' }
     }
     if (-not (Test-Chromium $Py)) {
         Write-Host 'Installing project-local Playwright Chromium...'
-        Invoke-PythonStep $Py @('-m', 'playwright', 'install', 'chromium') 'Chromium installation failed. Check Internet/proxy access and disk space.'
-        if (-not (Test-Chromium $Py)) { throw 'Chromium could not launch after installation. Check endpoint security and OS compatibility.' }
+        $Browser = Invoke-Native -FilePath $Py -Arguments @('-I', '-m', 'playwright', 'install', 'chromium', '--no-shell')
+        if ($Browser.ExitCode -ne 0) {
+            $Last = @($Browser.Tail | Select-Object -Last 8) -join "`n    "
+            throw "Chromium installation failed.`n  $(Get-InstallHint $Browser.Output)`n  Last output:`n    $Last"
+        }
+        if (-not (Test-Chromium $Py)) { throw 'Chromium could not start after installation. Security software or application control may block automation\browsers; ask IT to allow it.' }
     }
     return $Py
 }

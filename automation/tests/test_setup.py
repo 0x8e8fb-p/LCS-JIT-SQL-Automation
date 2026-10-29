@@ -34,9 +34,9 @@ def test_setup_first_run_and_repeat_are_idempotent(tmp_path, fresh):
     app = tmp_path / 'app with spaces'
     app.mkdir()
     (app / 'requirements.txt').write_text('requirements')
-    for name in ('main.py', 'automation_support.py', 'lcs_jit_automation.py', 'sql_executor.py', 'defaults.yaml'):
+    for name in ('main.py', 'automation_support.py', 'lcs_jit_automation.py', 'sql_executor.py', 'setup_checks.py', 'defaults.yaml'):
         (app / name).write_text('fixture')
-    body = f'''
+    body = f"""
 $script:Ready = ${str(not fresh).lower()}
 $script:Packages = ${str(not fresh).lower()}
 $script:Driver = ${str(not fresh).lower()}
@@ -56,39 +56,104 @@ function Test-PythonPackages {{ param($Python) return $script:Packages }}
 function Test-SqlDriver {{ param($Python) return $script:Driver }}
 function Install-SqlDriver {{ param($AppDir) $script:Calls.Add('odbc'); $script:Driver=$true }}
 function Test-Chromium {{ param($Python) return $script:Browser }}
-function Invoke-PythonStep {{
-    param($Python, $Arguments, $Failure)
-    if ($Arguments -contains 'install' -and $Arguments -contains 'pip') {{ $script:Calls.Add('pip-install'); $script:Packages=$true }}
+function Invoke-Native {{
+    param($FilePath, $Arguments, [switch]$Quiet)
+    if ($Arguments -contains 'pip' -and $Arguments -contains 'install') {{ $script:Calls.Add('pip-install'); $script:Packages=$true }}
     elseif ($Arguments -contains 'check') {{ $script:Calls.Add('pip-check') }}
-    elseif ($Arguments -contains 'playwright') {{ $script:Calls.Add('chromium'); $script:Browser=$true }}
+    elseif ($Arguments -contains 'playwright') {{ $script:Calls.Add('chromium' + [string]($Arguments -contains '--no-shell')); $script:Browser=$true }}
+    return [pscustomobject]@{{ ExitCode = 0; Started = $true; Tail = @(); Output = '' }}
 }}
 if ($script:Ready) {{
     New-Item -ItemType Directory -Force -Path (Join-Path $App '.venv') | Out-Null
-    Set-Content -LiteralPath (Join-Path $App '.venv/requirements.sha256') -Value (Get-FileHash (Join-Path $App 'requirements.txt')).Hash
+    Set-Content -LiteralPath (Join-Path $App '.venv/requirements.sha256') -Value (Get-RequirementsStamp (Join-Path $App 'requirements.txt'))
 }}
 $first = Initialize-Prerequisites -AppDir $App
 $second = Initialize-Prerequisites -AppDir $App
 if ($first -ne $second -or $first -notlike '*python.exe') {{ throw 'Incorrect Python return value' }}
 Write-Output ('calls=' + ($script:Calls -join ','))
-'''
+"""
     result = invoke(tmp_path, body)
     assert result.returncode == 0, result.stdout + result.stderr
     if fresh:
-        assert 'calls=preflight,python,venv,pip-install,pip-check,odbc,chromium,preflight,pip-check' in result.stdout
+        assert 'calls=preflight,python,venv,pip-install,pip-check,odbc,chromiumTrue,preflight,pip-check' in result.stdout
     else:
         assert 'calls=preflight,pip-check,preflight,pip-check\n' in result.stdout
 
 
-@pytest.mark.parametrize(('code', 'expected'), [(0, 'ok'), (3010, 'requires a restart'),
-                                               (1641, 'requires a restart'), (1603, 'Installer failed')])
-def test_installer_exit_codes(tmp_path, code, expected):
-    result = invoke(tmp_path, f'''
-function Start-Process {{ param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $Verb) return [pscustomobject]@{{ExitCode={code}}} }}
-try {{ Invoke-SetupProcess -Executable 'fake-installer' -Arguments @('/quiet') -LogPath 'setup.log'; Write-Output 'ok' }}
-catch {{ Write-Output $_.Exception.Message; exit 1 }}
-''')
-    assert result.returncode == (0 if code == 0 else 1), result.stdout + result.stderr
+@pytest.mark.parametrize(('codes', 'expected', 'sleeps'), [
+    ([0], 'installed', 0),
+    ([3010], 'restart later; this run can continue', 0),
+    ([1618, 1618, 0], 'installed', 2),
+    ([1618] * 5, 'kept running for about 2 minutes', 4),
+    ([1641], 'requires a restart now', 0),
+    ([1223], 'prompt was declined', 0),
+    ([1603], 'failed (exit 1603)', 0),
+])
+def test_odbc_installer_exit_codes(tmp_path, codes, expected, sleeps):
+    app = tmp_path / 'app'
+    (app / 'runtime/installers').mkdir(parents=True)
+    result = invoke(tmp_path, f"""
+$script:Codes = [System.Collections.Generic.Queue[int]]::new()
+foreach ($Code in @({', '.join(map(str, codes))})) {{ $script:Codes.Enqueue($Code) }}
+$script:Sleeps = 0
+$script:Staged = @()
+function Get-VerifiedInstaller {{ param($Url, $Destination, $Publisher) Set-Content -LiteralPath $Destination -Value 'msi'; return $Destination }}
+function Test-Administrator {{ return $true }}
+function Start-Sleep {{ param($Seconds) $script:Sleeps++ }}
+function Start-Installer {{ param($FilePath, $Arguments, [switch]$Elevate) $script:Staged += $Arguments[1]; return $script:Codes.Dequeue() }}
+if (-not $env:SystemRoot) {{ $env:SystemRoot = {ps_quote(tmp_path)} }}
+try {{ Install-SqlDriver -AppDir {ps_quote(app)}; Write-Output 'installed' }} catch {{ Write-Output $_.Exception.Message }}
+Write-Output ("sleeps=" + $script:Sleeps)
+$Temp = [IO.Path]::GetTempPath()
+Write-Output ("staged-in-temp=" + (@($script:Staged | Where-Object {{ $_.Trim('"').StartsWith($Temp) }}).Count -eq $script:Staged.Count))
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
     assert expected in result.stdout
+    assert f'sleeps={sleeps}' in result.stdout
+    assert 'staged-in-temp=True' in result.stdout
+
+
+def test_declined_administrator_prompt_is_reported_as_1223(tmp_path):
+    result = invoke(tmp_path, """
+function Start-Process { throw [System.ComponentModel.Win32Exception]::new(1223) }
+Write-Output ("code=" + (Start-Installer -FilePath 'msiexec.exe' -Arguments @('/i') -Elevate))
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'code=1223' in result.stdout
+
+
+def test_requirements_stamp_ignores_line_endings_but_not_python(tmp_path):
+    lf, crlf = tmp_path / 'lf.txt', tmp_path / 'crlf.txt'
+    lf.write_bytes(b'playwright==1.63.0\npyodbc==5.3.0\n')
+    crlf.write_bytes(b'playwright==1.63.0\r\npyodbc==5.3.0\r\n')
+    result = invoke(tmp_path, f"""
+$A = Get-RequirementsStamp {ps_quote(lf)}
+$B = Get-RequirementsStamp {ps_quote(crlf)}
+$script:PythonVersion = '3.13.17'
+$C = Get-RequirementsStamp {ps_quote(lf)}
+Write-Output ("same=" + ($A -eq $B) + " python=" + ($A -ne $C))
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'same=True python=True' in result.stdout
+
+
+def test_blocked_download_hosts_are_listed_together_before_installing(tmp_path):
+    app = tmp_path / 'app'
+    app.mkdir()
+    for name in ('main.py', 'automation_support.py', 'lcs_jit_automation.py', 'sql_executor.py', 'setup_checks.py', 'requirements.txt', 'defaults.yaml'):
+        (app / name).write_text('fixture')
+    result = invoke(tmp_path, f"""
+function Assert-SetupReady {{ param($AppDir) }}
+function Get-RequiredDownloads {{ param($AppDir) return @('https://pypi.org/', 'https://files.pythonhosted.org/', 'https://cdn.playwright.dev/') }}
+function Test-HostReachable {{ param($Url) if ($Url -match 'pypi|pythonhosted') {{ return 'certificate not trusted (TLS inspection?)' }}; return '' }}
+function Initialize-RuntimePython {{ throw 'installer started' }}
+try {{ Initialize-Prerequisites -AppDir {ps_quote(app)} }} catch {{ Write-Output $_.Exception.Message }}
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert 'cannot be reached' in out and 'nothing was installed' in out
+    assert 'pypi.org: certificate not trusted' in out and 'files.pythonhosted.org: certificate not trusted' in out
+    assert 'cdn.playwright.dev' not in out and 'installer started' not in out
 
 
 @pytest.mark.parametrize('failure', ['checksum', 'unsigned', 'publisher'])
