@@ -10,7 +10,7 @@ from collections.abc import Iterator
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 import uuid
@@ -32,6 +32,127 @@ class AutomationError(Exception):
         super().__init__(message)
         self.step = step
         self.message = message
+
+
+# --- Safe diagnostics -------------------------------------------------------
+# Raw browser, ODBC, OS and YAML messages can contain URLs, SQL text, user names
+# or passwords. Diagnostics therefore carry only class names, numeric codes and
+# fixed categories derived from the message, never the message itself.
+_SAFE_NAME = re.compile(r'[A-Za-z0-9 ._()+-]{1,80}')
+_NET_ERROR = re.compile(r'net::ERR_[A-Z0-9_]{2,60}')
+_BROWSER_PATTERNS = (
+    ('executable_missing', re.compile(r"Executable doesn't exist|Looks like Playwright|playwright install", re.I)),
+    ('profile_in_use', re.compile(r'ProcessSingleton|SingletonLock|profile (?:appears to be )?in use|user data directory is already in use', re.I)),
+    ('browser_closed', re.compile(r'has been closed|Target closed|Browser closed', re.I)),
+    ('timeout', re.compile(r'Timeout \d+ ?ms exceeded', re.I)),
+    ('launch_failed', re.compile(r'Failed to launch|spawn \S+ (?:EACCES|EPERM|UNKNOWN|ENOENT)|exitCode=', re.I)),
+)
+PACKAGE_MODULES = {'playwright', 'pyodbc', 'yaml', 'cryptography', 'greenlet', 'pyee', 'cffi', '_cffi_backend'}
+
+
+def error_chain(error: BaseException, limit: int = 3) -> list[BaseException]:
+    """The error plus up to two causes, including contexts hidden by 'from None'."""
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and len(chain) < limit and all(current is not seen for seen in chain):
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def safe_file_name(value: object) -> str:
+    name = PureWindowsPath(str(value)).name
+    return name if _SAFE_NAME.fullmatch(name) else '<file>'
+
+
+def browser_category(error: BaseException) -> str | None:
+    """Fixed category for a Playwright error; None for other exception types."""
+    if not type(error).__module__.startswith('playwright'):
+        return None
+    text = str(error)
+    network = _NET_ERROR.search(text)
+    if network:
+        return network.group(0)
+    if type(error).__name__ == 'TimeoutError':
+        return 'timeout'
+    for category, pattern in _BROWSER_PATTERNS:
+        if pattern.search(text):
+            return category
+    return 'other'
+
+
+def odbc_codes(error: BaseException) -> dict[str, Any] | None:
+    """SQLSTATE and native error numbers of a pyodbc error (digits only)."""
+    if type(error).__module__.split('.')[0] != 'pyodbc':
+        return None
+    state = str(error.args[0]) if error.args else ''
+    codes: dict[str, Any] = {'sqlstate': state if re.fullmatch(r'[A-Z0-9]{5}', state) else 'unknown'}
+    natives = sorted({int(number) for argument in error.args[1:] for number in re.findall(r'\((\d{1,6})\)', str(argument))})
+    if natives:
+        codes['native'] = natives[:5]
+    return codes
+
+
+def describe_error(error: BaseException) -> dict[str, Any]:
+    """Secret-free description: class names, OS/ODBC codes, browser category."""
+    chain = error_chain(error)
+    info: dict[str, Any] = {'type': type(error).__name__}
+    if len(chain) > 1:
+        info['causes'] = [type(item).__name__ for item in chain[1:]]
+    for item in chain:
+        if isinstance(item, OSError):
+            if item.errno is not None:
+                info.setdefault('errno', item.errno)
+            winerror = getattr(item, 'winerror', None)
+            if winerror:
+                info.setdefault('winerror', winerror)
+            if item.filename:
+                info.setdefault('file', safe_file_name(item.filename))
+        if isinstance(item, ImportError) and item.name and re.fullmatch(r'[A-Za-z0-9_.]{1,60}', item.name):
+            info.setdefault('module', item.name)
+        category = browser_category(item)
+        if category:
+            info.setdefault('browser', category)
+        codes = odbc_codes(item)
+        if codes:
+            info.setdefault('odbc', codes)
+    return info
+
+
+def explain_error(error: BaseException, step: str) -> str:
+    """Actionable message for an unexpected (non-AutomationError) failure."""
+    info = describe_error(error)
+    chain = error_chain(error)
+    module = str(info.get('module', ''))
+    if any(isinstance(item, ImportError) for item in chain):
+        name = module.split('.')[0] if module.split('.')[0] in PACKAGE_MODULES else 'a required package'
+        return f'Python package {name} is missing or damaged in automation/.venv. Rerun run.cmd to repair the local environment.'
+    browser = str(info.get('browser', ''))
+    if browser.startswith('net::ERR_'):
+        return f'Network error {browser} while the browser loaded LCS during {step}. Check Internet, VPN and proxy access to LCS and Microsoft sign-in.'
+    messages = {
+        'executable_missing': 'Playwright Chromium is missing or incomplete. Rerun run.cmd to reinstall it.',
+        'profile_in_use': 'The saved browser profile is in use by another Chromium window. Close browser windows opened by this tool (or end chrome.exe processes started from automation/browsers) and retry.',
+        'browser_closed': f'The automation browser closed before {step} finished. Keep its window open until the run ends; if it closes by itself, check security software.',
+        'launch_failed': 'Chromium could not start. Security software or application control may be blocking automation/browsers; ask IT to allow it, or rerun run.cmd to reinstall Chromium.',
+        'timeout': f'LCS did not respond in time during {step}. Retry; if it keeps happening, check VPN/proxy speed and that LCS opens in a normal browser.',
+    }
+    if browser in messages:
+        return messages[browser]
+    if browser:
+        return f'Browser automation failed during {step} ({info["type"]}). Retry; the safe diagnostic in automation/logs/diagnostics shows the category.'
+    if any(isinstance(item, EOFError) for item in chain):
+        return 'Sign-in needs an interactive console. Run run.cmd from PowerShell or Windows Terminal once; -Headless runs reuse that login.'
+    if 'odbc' in info:
+        codes = info['odbc']
+        native = ', native ' + ', '.join(str(number) for number in codes.get('native', [])) if codes.get('native') else ''
+        return f'ODBC error (SQLSTATE {codes["sqlstate"]}{native}) during {step}. See README.md#troubleshooting.'
+    os_error = next((item for item in chain if isinstance(item, OSError)), None)
+    if os_error is not None:
+        code = info.get('winerror') or info.get('errno') or 'unknown'
+        target = f' on {info["file"]}' if 'file' in info else ''
+        return f'File system error {code}{target} during {step}. Check folder permissions, antivirus or OneDrive locks, and free disk space.'
+    return f'Unexpected {info["type"]} during {step}. A safe diagnostic was saved under automation/logs/diagnostics; see README.md#troubleshooting.'
 
 
 @contextmanager
@@ -151,6 +272,7 @@ class Config:
     browser_timezone: str = 'UTC'
     odbc_driver: str = 'ODBC Driver 18 for SQL Server'
     auth_key_path: Path | None = None
+    minimal_profile: bool = False
 
     @property
     def lcs_origin(self) -> str:
@@ -172,7 +294,8 @@ class Config:
                 raise ValueError('mapping required')
             data: dict[str, Any] = {key: value.strip() if isinstance(value, str) else value for key, value in raw.items()}
             minimal_keys = {'ENVIRONMENT_URL', 'ACCESS_REASON', 'ACCESS_DETAILS', 'FIREWALL_RULE_NAME'}
-            if 'selectors' not in data:
+            minimal = 'selectors' not in data
+            if minimal:
                 if set(data) - minimal_keys or any(key in os.environ for key in ENV_KEYS - minimal_keys):
                     raise ValueError('Advanced settings require an explicit selectors profile; remove stale environment overrides')
             for key in ENV_KEYS:
@@ -307,8 +430,11 @@ class Config:
             timezone = text('BROWSER_TIMEZONE', 'UTC')
             if timezone != 'UTC':
                 raise ValueError('Only verified UTC browser timezone is currently supported')
-            import pyodbc
-            installed = pyodbc.drivers()
+            try:
+                import pyodbc
+                installed = list(pyodbc.drivers())
+            except Exception:
+                installed = [] # A broken pyodbc is reported by check_runtime, not as a config error.
             auto_driver = next((name for name in ('ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server') if name in installed), 'ODBC Driver 18 for SQL Server')
             driver = text('SQL_ODBC_DRIVER', auto_driver)
             if driver not in {'ODBC Driver 17 for SQL Server', 'ODBC Driver 18 for SQL Server'}:
@@ -325,7 +451,7 @@ class Config:
                        positive('SQL_TIMEOUT_SECONDS', 60, 3600),
                        positive('MAX_RESULT_ROWS', 100, 10000), dict(selectors),
                        environment_url, timezone, driver,
-                       key_path)
+                       key_path, minimal)
         except (OSError, ValueError, TypeError, yaml.YAMLError):
             # YAML/parser errors may quote secret-bearing config lines.
-            raise AutomationError('configuration', 'Invalid configuration. Paste a complete HTTPS LCS environment URL, an exact supported ACCESS_REASON, non-empty ACCESS_DETAILS, and a valid FIREWALL_RULE_NAME. Remove duplicate YAML keys/stale advanced environment overrides. See automation/README.md for advanced profiles.') from None
+            raise AutomationError('configuration', 'Invalid configuration. Paste a complete HTTPS LCS environment URL, an exact supported ACCESS_REASON, non-empty ACCESS_DETAILS, and a valid FIREWALL_RULE_NAME. Remove duplicate YAML keys/stale advanced environment overrides. See README.md#configuration for the fields and README.md#advanced-profiles for profiles.') from None

@@ -4,17 +4,62 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
+import re
 import sys
 import time
 import traceback
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import sync_playwright
+APP_DIR = Path(__file__).resolve().parent
+COMMANDS = ['run', 'bootstrap', 'import-auth', 'validate', 'check-auth']
+_IMPORT_ERROR: ImportError | None = None
 
-from automation_support import AutomationError, Config, Credentials, LCS_HOSTS, environment_lock, timestamp, utcnow
-from lcs_jit_automation import LCSAutomation, get_public_ip, save_auth
-from sql_executor import PreparedScript, execute_sql_scripts, prepare_scripts, scrub, validate_scripts
+try:
+    from playwright.sync_api import sync_playwright
+
+    from automation_support import (AutomationError, Config, Credentials, LCS_HOSTS, describe_error, environment_lock,
+                                    explain_error, timestamp, utcnow)
+    from lcs_jit_automation import LCSAutomation, get_public_ip, save_auth
+    from sql_executor import PreparedScript, execute_sql_scripts, prepare_scripts, scrub, validate_scripts
+except ImportError as import_error:  # damaged or partial environment: still answer in JSON
+    _IMPORT_ERROR = import_error
+
+
+def import_failure_report(error: ImportError) -> dict[str, Any]:
+    """Report without project imports; any of them may be what failed."""
+    name = (error.name or '').split('.')[0]
+    known = {'playwright', 'pyodbc', 'yaml', 'cryptography', 'greenlet', 'pyee', 'cffi', 'automation_support',
+             'lcs_jit_automation', 'sql_executor'}
+    package = name if name in known else 'a required package'
+    return {'status': 'failure', 'failed_at_step': 'configuration',
+            'error_message': f'Python package {package} is missing or damaged in automation/.venv. Rerun run.cmd to repair the local environment.',
+            'diagnostic': {'type': type(error).__name__, 'module': package}, 'screenshot_path': None, 'exit_code': 1}
+
+
+def runtime_facts() -> dict[str, Any]:
+    facts: dict[str, Any] = {'python': platform.python_version(), 'platform': platform.platform(), 'machine': platform.machine()}
+    try:
+        from importlib.metadata import version
+        facts['playwright'] = version('playwright')
+    except Exception:
+        pass
+    return facts
+
+
+def save_diagnostics(logs_path: Path, command: str, output: dict[str, Any]) -> None:
+    """Best effort: a failed write never changes the command result."""
+    record = {'command': command, 'created_at': timestamp(utcnow()), 'failed_at_step': output.get('failed_at_step'),
+              'error_message': output.get('error_message'), 'diagnostic': output.get('diagnostic', {}), 'runtime': runtime_facts()}
+    try:
+        folder = logs_path / 'diagnostics'
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f'{command}-{utcnow().strftime("%Y%m%dT%H%M%S%fZ")}.json'
+        path.write_text(json.dumps(record, indent=2), encoding='utf-8')
+        output['diagnostic_file'] = str(path)
+    except OSError:
+        output['diagnostic_write_failed'] = True
 
 
 def write_diagnostic(path: Path, data: dict[str, Any], output: dict[str, Any]) -> None:
@@ -60,15 +105,16 @@ def run(config: Config, log_dir: Path, *, headed: bool = False, interactive_auth
                 output.update(failed_at_step='script_execution', error_message='One or more scripts failed. See sanitized sql_execution.details; successful earlier scripts remain committed.', exit_code=1,
                               screenshot_path=adapter.screenshot('error_script_execution'))
         except Exception as error:
-            diagnostic = {'exception_type': type(error).__name__, 'frames': [
+            details = describe_error(error)
+            diagnostic = {'exception_type': type(error).__name__, **details, 'frames': [
                 {'file': Path(frame.filename).name, 'line': frame.lineno, 'function': frame.name}
                 for frame in traceback.extract_tb(error.__traceback__) if Path(frame.filename).name in {'main.py', 'lcs_jit_automation.py', 'sql_executor.py', 'automation_support.py'}]}
             if isinstance(error, AutomationError):
                 step, message = error.step, error.message
             else:
                 step = adapter.step if adapter is not None and step not in {'sql_connection', 'script_execution'} else step
-                message = 'Automation failed. Check installed browser/ODBC dependencies, authentication, configured selectors, and network connectivity; raw exception suppressed for security.'
-            output = {'status': 'failure', 'failed_at_step': step, 'error_message': message,
+                message = explain_error(error, step)
+            output = {'status': 'failure', 'failed_at_step': step, 'error_message': message, 'diagnostic': details,
                       'screenshot_path': adapter.screenshot('error') if adapter is not None else None, 'exit_code': 1}
             write_diagnostic(log_dir / 'diagnostic.json', diagnostic, output)
         finally:
@@ -80,14 +126,14 @@ def run(config: Config, log_dir: Path, *, headed: bool = False, interactive_auth
                     else:
                         output['cleanup'] = {'status': 'not_requested' if not config.disable_access_after else 'not_needed'}
                 except Exception as cleanup_error:
-                    cleanup_detail = {'exception_type': type(cleanup_error).__name__}
+                    cleanup_detail = {'exception_type': type(cleanup_error).__name__, **describe_error(cleanup_error)}
                     if log_dir is not None:
                         write_diagnostic(log_dir / 'cleanup_diagnostic.json', cleanup_detail, output)
                     if isinstance(cleanup_error, AutomationError):
                         message = cleanup_error.message + ' Remove the automation-owned source IP rule manually if present; SQL credentials may remain valid until expiry.'
                     else:
                         message = 'Could not confirm source IP removal. Remove the host IP manually in LCS. SQL credentials may remain valid until expiry.'
-                    output['cleanup'] = {'status': 'failure', 'error_message': message}
+                    output['cleanup'] = {'status': 'failure', 'error_message': message, 'diagnostic': describe_error(cleanup_error)}
                     if output.get('status') == 'success':
                         output.update(status='failure', failed_at_step='cleanup', error_message=output['cleanup']['error_message'], exit_code=1,
                                       screenshot_path=adapter.screenshot('error_cleanup'))
@@ -104,28 +150,50 @@ def run(config: Config, log_dir: Path, *, headed: bool = False, interactive_auth
     return safe_output
 
 
+def installed_sql_drivers() -> list[str]:
+    try:
+        import pyodbc
+        return [name for name in pyodbc.drivers() if isinstance(name, str)]
+    except Exception:
+        raise AutomationError('configuration', 'The pyodbc ODBC module could not load. Rerun run.cmd to repair automation/.venv; if it keeps failing, reinstall Microsoft ODBC Driver 18 for SQL Server (x64).') from None
+
+
 def check_runtime(config: Config) -> None:
     """Fail locally before requesting firewall/JIT access."""
-    import pyodbc
-    if config.odbc_driver not in pyodbc.drivers():
-        raise AutomationError('configuration', 'Configured SQL_ODBC_DRIVER is not installed. Install Microsoft ODBC Driver 17/18 or select an installed supported driver in config.yaml; pip cannot install it.')
+    installed = installed_sql_drivers()
+    if config.odbc_driver not in installed:
+        if config.minimal_profile:
+            raise AutomationError('configuration', 'Microsoft ODBC Driver 18 or 17 for SQL Server (x64) is not installed. Rerun run.cmd (it installs Driver 18 with administrator approval) or ask IT to install it.')
+        found = [name for name in installed if 'SQL Server' in name and re.fullmatch(r'[A-Za-z0-9 ._()-]{1,80}', name)]
+        listing = ', '.join(found) if found else 'none'
+        raise AutomationError('configuration', f'Configured SQL_ODBC_DRIVER "{config.odbc_driver}" is not installed (installed SQL Server drivers: {listing}). Install it, or change SQL_ODBC_DRIVER in your profile.')
     with sync_playwright() as playwright:
         if not Path(playwright.chromium.executable_path).is_file():
-            raise AutomationError('configuration', 'Playwright Chromium is missing. Run ./run.ps1 to install it locally.')
+            raise AutomationError('configuration', 'Playwright Chromium is missing. Rerun run.cmd to install it locally.')
+
+
+def unexpected_step(error: BaseException) -> str:
+    browser = str(describe_error(error).get('browser', ''))
+    return 'browser_start' if browser in {'executable_missing', 'launch_failed', 'profile_in_use'} else 'configuration'
 
 
 def main(argv: list[str] | None = None) -> int:
+    if _IMPORT_ERROR is not None:
+        print(json.dumps(import_failure_report(_IMPORT_ERROR), indent=2))
+        return 1
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['run', 'bootstrap', 'import-auth', 'validate', 'check-auth'], nargs='?', default='run')
-    parser.add_argument('--config', type=Path, default=Path(__file__).resolve().parent.parent / 'config.yaml')
+    parser.add_argument('command', choices=COMMANDS, nargs='?', default='run')
+    parser.add_argument('--config', type=Path, default=APP_DIR.parent / 'config.yaml')
     parser.add_argument('--cdp-url', default='http://127.0.0.1:9222', help='Loopback-only Edge debugging URL for import-auth')
     parser.add_argument('--headed', action='store_true', help='Run the browser UI visibly instead of headless')
     parser.add_argument('--interactive-auth', action='store_true', help='Authenticate interactively in the current run browser before continuing')
     parser.add_argument('--check-runtime', action='store_true', help='Also verify installed ODBC driver and Chromium during validate')
     args = parser.parse_args(argv)
     log_dir: Path | None = None
+    logs_path: Path | None = None  # Known only once the configuration loaded.
     try:
         config = Config.load(args.config, bootstrap=args.command in {'bootstrap', 'import-auth'})
+        logs_path = config.logs_path
         if args.command == 'validate':
             files = validate_scripts(config.scripts_path)
             if args.check_runtime:
@@ -178,12 +246,15 @@ def main(argv: list[str] | None = None) -> int:
             with environment_lock(config):
                 output = run(config, log_dir, headed=args.headed, interactive_auth=args.interactive_auth, scripts=scripts)
     except Exception as error:
-        output = {'status': 'failure', 'failed_at_step': error.step if isinstance(error, AutomationError) else 'configuration',
-                  'error_message': error.message if isinstance(error, AutomationError) else 'Startup failed. Verify local dependencies, configuration, and file permissions; raw error suppressed.',
-                  'screenshot_path': None, 'exit_code': 1}
+        output = {'status': 'failure', 'failed_at_step': error.step if isinstance(error, AutomationError) else unexpected_step(error),
+                  'error_message': error.message if isinstance(error, AutomationError) else explain_error(error, args.command),
+                  'diagnostic': describe_error(error), 'screenshot_path': None, 'exit_code': 1}
     output = scrub(output, (os.environ.get('LCS_AUTH_KEY', ''),))
-    if output.get('status') == 'failure' and not output.get('screenshot_path'):
-        output['screenshot_note'] = 'Browser state unavailable or safe masking failed; no unmasked image was written.'
+    if output.get('status') == 'failure':
+        if not output.get('screenshot_path'):
+            output['screenshot_note'] = 'Browser state unavailable or safe masking failed; no unmasked image was written.'
+        if logs_path is not None:
+            save_diagnostics(logs_path, args.command, output)
     encoded = json.dumps(output, indent=2, allow_nan=False)
     if log_dir is not None:
         try:

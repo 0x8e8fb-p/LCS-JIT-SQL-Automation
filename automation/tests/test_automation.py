@@ -18,7 +18,7 @@ import lcs_jit_automation as lcs
 import main
 import sql_executor as sql
 from automation_support import AutomationError, Config, Credentials, parse_expiry, parse_server_database, utcnow
-from helpers import real_pyodbc
+
 
 
 @pytest.fixture
@@ -305,8 +305,8 @@ def clean_child_environment(**extra):
     return env
 
 
-@pytest.mark.skipif(not real_pyodbc(), reason='the child process needs a loadable pyodbc (unixODBC on macOS/Linux)')
 def test_cli_subprocess_validation_and_invalid_input(config, tmp_path):
+    # Also proves validate works where pyodbc cannot load (it is only needed for SQL).
     path = config_file(config, tmp_path)
     result = subprocess.run([sys.executable, str(Path(main.__file__)), 'validate', '--config', str(path)],
                             capture_output=True, text=True, env=clean_child_environment())

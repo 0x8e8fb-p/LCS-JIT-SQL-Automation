@@ -8,7 +8,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-import pyodbc
+try:
+    import pyodbc
+except ImportError:  # Reported clearly by check_runtime / execute_sql_scripts when SQL is needed.
+    pyodbc = None  # type: ignore[assignment]
 
 from automation_support import AutomationError, Config, Credentials, timestamp, utcnow
 
@@ -160,6 +163,8 @@ def safe_sql_error(error: pyodbc.Error) -> str:
 
 
 def execute_sql_scripts(credentials: Credentials, config: Config, files: list[Path] | list[PreparedScript] | None = None) -> dict[str, Any]:
+    if pyodbc is None:
+        raise AutomationError('sql_connection', 'The pyodbc ODBC module could not load. Rerun run.cmd to repair automation/.venv.')
     files = prepare_scripts(config.scripts_path) if files is None else files
     results: dict[str, Any] = {
         'total_scripts': len(files), 'scripts_executed': 0, 'scripts_failed': 0,

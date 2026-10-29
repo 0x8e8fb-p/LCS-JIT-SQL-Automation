@@ -18,7 +18,7 @@ from urllib.request import urlopen
 from cryptography.fernet import Fernet, InvalidToken
 from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwright, Error as BrowserError
 
-from automation_support import AutomationError, Config, Credentials, LCS_HOSTS, parse_expiry, parse_server_database, timestamp, utcnow
+from automation_support import AutomationError, Config, Credentials, LCS_HOSTS, describe_error, parse_expiry, parse_server_database, timestamp, utcnow
 
 LCS_URL = 'https://lcs.dynamics.com'
 LOGIN_HOSTS = {'login.microsoftonline.com', 'login.live.com', 'login.windows.net'}
@@ -137,9 +137,9 @@ class LCSAutomation:
         except AutomationError:
             self.close()
             raise
-        except Exception:
+        except Exception as error:
             self.close()
-            raise AutomationError('authentication', 'Browser context could not be opened. Close any leftover Chromium processes and retry.') from None
+            raise AutomationError('browser_start', self._browser_start_message(error, profile_dir)) from None
         self.ip_rule_attempted = False
         self.public_ip = ''
         self.requested_at = utcnow()
@@ -147,6 +147,21 @@ class LCSAutomation:
         self.step = 'authentication'
         self.rule_name = ''
         self.rule_created = False
+
+    @staticmethod
+    def _browser_start_message(error: BaseException, profile_dir: Path | None) -> str:
+        """Specific, secret-free reason why Chromium did not start."""
+        category = str(describe_error(error).get('browser', ''))
+        if category == 'profile_in_use':
+            folder = f' ({profile_dir.name})' if profile_dir is not None else ''
+            return (f'The saved browser profile{folder} is in use by another Chromium window. Close browser windows opened by this tool '
+                    '(or end chrome.exe processes started from automation/browsers) and retry.')
+        if category == 'executable_missing':
+            return 'Playwright Chromium is missing or incomplete. Rerun run.cmd to reinstall it.'
+        if category == 'timeout':
+            return 'Chromium did not start within the time limit. Retry; security software scanning a new browser can slow the first start.'
+        return ('Chromium could not start. Security software or application control may be blocking automation/browsers; '
+                'ask IT to allow it, or rerun run.cmd to reinstall Chromium. A safe diagnostic is in automation/logs/diagnostics.')
 
     def _profile_dir(self) -> Path | None:
         if self.config.auth_key_path is None:
