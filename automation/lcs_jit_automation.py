@@ -18,7 +18,7 @@ from urllib.request import urlopen
 from cryptography.fernet import Fernet, InvalidToken
 from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwright, Error as BrowserError
 
-from automation_support import AutomationError, Config, Credentials, LCS_HOSTS, describe_error, parse_expiry, parse_server_database, timestamp, utcnow
+from automation_support import AutomationError, Config, Credentials, LCS_HOSTS, default_rule_name, describe_error, parse_expiry, parse_server_database, timestamp, utcnow
 
 LCS_URL = 'https://lcs.dynamics.com'
 LOGIN_HOSTS = {'login.microsoftonline.com', 'login.live.com', 'login.windows.net'}
@@ -492,12 +492,13 @@ class LCSAutomation:
                 self.close_dialog(dialog)
                 self.screenshot('02_existing_ip_rule')
                 return # Existing rule is NOT owned and will never be deleted.
-        desired_name = self.config.selectors.get('rule_name', '')
-        if desired_name:
-            for row in self.rule_rows(dialog).all():
-                if row.locator("input[name='NetworkSecurityRuleName']").input_value() == desired_name:
-                    raise AutomationError('ip_rule', 'Configured rule name already exists with a different IP/service or expired window; existing rules will not be modified.')
-        self.rule_name = desired_name or 'lcsjit-' + uuid.uuid4().hex[:16]
+        desired_name = self.config.selectors.get('rule_name', '') or default_rule_name()
+        for row in self.rule_rows(dialog).all():
+            if row.locator("input[name='NetworkSecurityRuleName']").input_value() == desired_name:
+                raise AutomationError('ip_rule', f'Firewall rule {desired_name} already exists in LCS for a different IP address or service, or it has expired. '
+                                      'It is probably left over from an earlier run: remove it in LCS (Maintain > Enable access) and rerun. '
+                                      'This tool never changes rules it did not create in the current run.')
+        self.rule_name = desired_name
         self.locator('rule_add', scope=dialog).click()
         add = self.locator('rule_add_dialog')
         add.wait_for(state='visible')

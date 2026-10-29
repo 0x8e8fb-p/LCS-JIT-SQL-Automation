@@ -287,6 +287,10 @@ class Config:
     minimal_profile: bool = False
 
     @property
+    def public_ip_source(self) -> str:
+        return 'config' if self.public_ip else 'auto'
+
+    @property
     def lcs_origin(self) -> str:
         if self.environment_url:
             target = urlsplit(self.environment_url)
@@ -326,15 +330,18 @@ class Config:
             data[key] = value.strip() if isinstance(value, str) else value
         minimal = 'selectors' not in data
         if minimal:
-            unknown = sorted(printable_key(key) for key in set(data) - MINIMAL_KEYS)
+            unknown = sorted(printable_key(key) for key in set(data) - MINIMAL_YAML_KEYS)
             if unknown:
                 problems.append(f'unknown setting(s) {", ".join(unknown)} in {name} (config.yaml accepts only '
-                                f'{", ".join(sorted(MINIMAL_KEYS))}, advanced settings need a profile with selectors: README.md#advanced-profiles)')
-            conflicting = sorted(key for key in ENV_KEYS - MINIMAL_KEYS if key in os.environ)
+                                f'{", ".join(sorted(MINIMAL_YAML_KEYS))}, advanced settings need a profile with selectors: README.md#advanced-profiles)')
+            conflicting = sorted(key for key in ENV_KEYS - MINIMAL_KEYS - {'PUBLIC_IP'} if key in os.environ)
             if conflicting:
-                removal = '; '.join(f'Remove-Item Env:{key}' for key in conflicting)
+                removal = ', '.join(f'Remove-Item Env:{key}' for key in conflicting)
                 problems.append(f'environment variable(s) {", ".join(conflicting)} would override config.yaml (Windows matches names in any letter case), remove them '
                                 f'for this window with {removal} and permanently in System Properties > Environment Variables')
+            if 'PUBLIC_IP' in os.environ:
+                problems.append('environment variable PUBLIC_IP is not used with config.yaml (put PUBLIC_IP: "<IPv4>" in config.yaml instead '
+                                'and remove the variable with Remove-Item Env:PUBLIC_IP)')
             overrides = MINIMAL_KEYS
         else:
             unknown = sorted(printable_key(key) for key in data if key not in ENV_KEYS | {'selectors'})
@@ -345,8 +352,6 @@ class Config:
             if key in os.environ:
                 data[key] = os.environ[key].strip()
         if minimal:
-            if 'FIREWALL_RULE_NAME' not in data:
-                problems.append('FIREWALL_RULE_NAME is missing')
             defaults = yaml.safe_load(Path(__file__).with_name('defaults.yaml').read_text(encoding='utf-8'))
             data = {**defaults, **data}
 
@@ -422,6 +427,10 @@ class Config:
             problems.append('ACCESS_LEVEL must be read_only or read_write')
         if not bootstrap and not details:
             problems.append('ACCESS_DETAILS is empty (enter the approved justification for the LCS request)')
+        elif not bootstrap and details.startswith('REPLACE_'):
+            problems.append('ACCESS_DETAILS still contains the REPLACE_ placeholder (enter the approved justification for the LCS request)')
+        if environment.startswith('REPLACE_'):
+            problems.append('ENVIRONMENT_ID still contains the REPLACE_ placeholder (enter the exact environment name or leave it blank)')
         raw_selectors = data.get('selectors', {})
         selectors: dict[str, str] = {}
         if not isinstance(raw_selectors, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in raw_selectors.items()):
@@ -435,11 +444,11 @@ class Config:
             problems.append('the selected ACCESS_REASON grants read-only access, so ACCESS_LEVEL must be read_only')
         if reason in READ_WRITE_REASONS and level and level != 'read_write':
             problems.append('the selected ACCESS_REASON grants write access, so ACCESS_LEVEL must be read_write')
-        if 'FIREWALL_RULE_NAME' in data:
-            rule_name = text('FIREWALL_RULE_NAME')
-            if not RULE_NAME.fullmatch(rule_name):
-                problems.append('FIREWALL_RULE_NAME must be 1-64 letters, digits, underscores or hyphens, starting with a letter or digit')
-            selectors['rule_name'] = rule_name
+        rule_name = text('FIREWALL_RULE_NAME') if 'FIREWALL_RULE_NAME' in data else selectors.get('rule_name', '')
+        if rule_name and not RULE_NAME.fullmatch(rule_name):
+            problems.append('FIREWALL_RULE_NAME must be 1-64 letters, digits, underscores or hyphens, starting with a letter or digit (or blank for this computer\'s default)')
+        # Blank: a per-computer, per-user name, so machines sharing an environment never collide.
+        selectors['rule_name'] = rule_name or default_rule_name()
         if selectors.get('expiry_format', '') not in {'', 'iso8601', 'lcs_utc'}:
             problems.append('selectors.expiry_format must be iso8601 or lcs_utc')
         disable = boolean('DISABLE_ACCESS_AFTER', True)
@@ -460,7 +469,7 @@ class Config:
                 if not isinstance(address, ipaddress.IPv4Address) or not address.is_global:
                     raise ValueError('not global IPv4')
             except ValueError:
-                problems.append('PUBLIC_IP must be the public IPv4 address your SQL traffic leaves from, such as 203.0.113.10')
+                problems.append('PUBLIC_IP must be the public IPv4 address your SQL traffic leaves from (not a private 10.x, 172.16-31.x or 192.168.x address)')
         suffix = text('SQL_DNS_SUFFIX', 'database.windows.net') or 'database.windows.net'
         if not re.fullmatch(r'[A-Za-z0-9]+(?:\.[A-Za-z0-9-]+)+', suffix):
             problems.append('SQL_DNS_SUFFIX must be a DNS suffix such as database.windows.net')
@@ -502,7 +511,20 @@ class ConfigProblems(ValueError):
         self.items = items
 
 
-MINIMAL_KEYS = {'ENVIRONMENT_URL', 'ACCESS_REASON', 'ACCESS_DETAILS', 'FIREWALL_RULE_NAME'}
+MINIMAL_KEYS = {'ENVIRONMENT_URL', 'ACCESS_REASON', 'ACCESS_DETAILS', 'FIREWALL_RULE_NAME'}  # also environment-overridable
+MINIMAL_YAML_KEYS = MINIMAL_KEYS | {'PUBLIC_IP'}  # PUBLIC_IP: config.yaml only, never from the environment
+
+
+def default_rule_name() -> str:
+    """lcsjit-<8 hex>: stable for this computer and Windows user, different elsewhere."""
+    import getpass
+    import socket
+    computer = os.environ.get('COMPUTERNAME') or socket.gethostname()
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = os.environ.get('USERNAME', '')
+    return 'lcsjit-' + hashlib.sha256(f'{computer}\\{user}'.lower().encode('utf-8')).hexdigest()[:8]
 SUPPORTED_REASONS = {
     'AX troubleshooting (read-only to AX)': 'read_only',
     'MR troubleshooting (read-only to MR)': 'read_only',

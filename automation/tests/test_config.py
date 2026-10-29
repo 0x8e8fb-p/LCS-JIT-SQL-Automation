@@ -1,4 +1,6 @@
+import json
 import os
+import re
 from dataclasses import replace
 
 import pytest
@@ -35,11 +37,11 @@ def test_minimal_config_derives_internal_values(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('overrides', [
-    {'ENVIRONMENT_URL': 'https://example.com/V2/EnvironmentDetailsV3New/123456?EnvironmentId=11111111-2222-4333-8444-555555555555'},
+    {'ENVIRONMENT_URL': URL.replace('lcs.dynamics.com', 'example.com')},
     {'ENVIRONMENT_URL': URL + '&EnvironmentId=11111111-2222-4333-8444-555555555555'},
     {'ENVIRONMENT_URL': URL.replace('11111111-2222-4333-8444-555555555555', 'not-a-guid')},
     {'ACCESS_REASON': 'Unknown permission'}, {'ACCESS_DETAILS': ''},
-    {'FIREWALL_RULE_NAME': ''}, {'FIREWALL_RULE_NAME': 'not a safe name'},
+    {'FIREWALL_RULE_NAME': 'not a safe name'}, {'FIREWALL_RULE_NAME': '-starts-with-hyphen'},
     {'LCS_PROJECT_ID': 'another'},
 ])
 def test_minimal_config_refuses_unsafe_or_ambiguous_values(tmp_path, overrides):
@@ -47,13 +49,54 @@ def test_minimal_config_refuses_unsafe_or_ambiguous_values(tmp_path, overrides):
         Config.load(profile(tmp_path, **overrides))
 
 
-def test_minimal_config_requires_rule_name(tmp_path):
-    path = profile(tmp_path)
-    data = yaml.safe_load(path.read_text())
-    del data['FIREWALL_RULE_NAME']
-    path.write_text(yaml.safe_dump(data))
-    with pytest.raises(AutomationError, match='Invalid configuration'):
-        Config.load(path)
+@pytest.mark.parametrize('value', [None, ''])
+def test_missing_or_blank_rule_name_uses_per_machine_default(tmp_path, monkeypatch, value):
+    import getpass
+    path = profile(tmp_path, FIREWALL_RULE_NAME=value or '')
+    if value is None:
+        data = yaml.safe_load(path.read_text())
+        del data['FIREWALL_RULE_NAME']
+        path.write_text(yaml.safe_dump(data))
+    monkeypatch.setenv('COMPUTERNAME', 'PC-ONE')
+    monkeypatch.setattr(getpass, 'getuser', lambda: 'alice')
+    first = Config.load(path).selectors['rule_name']
+    assert re.fullmatch(r'lcsjit-[0-9a-f]{8}', first)
+    assert Config.load(path).selectors['rule_name'] == first  # stable on this computer and user
+    monkeypatch.setattr(getpass, 'getuser', lambda: 'bob')
+    assert Config.load(path).selectors['rule_name'] != first  # another Windows user
+    monkeypatch.setattr(getpass, 'getuser', lambda: 'alice')
+    monkeypatch.setenv('COMPUTERNAME', 'PC-TWO')
+    assert Config.load(path).selectors['rule_name'] != first  # another computer
+
+
+def test_explicit_rule_name_is_kept(tmp_path):
+    assert Config.load(profile(tmp_path, FIREWALL_RULE_NAME='lcsjit')).selectors['rule_name'] == 'lcsjit'
+
+
+def test_public_ip_in_config_yaml(tmp_path, capsys):
+    import main
+    config = Config.load(profile(tmp_path, PUBLIC_IP='8.8.8.8'))
+    assert config.public_ip == '8.8.8.8' and config.public_ip_source == 'config'
+    assert Config.load(profile(tmp_path)).public_ip_source == 'auto'
+    for bad in ('10.0.0.5', '127.0.0.1', '203.0.113.10', '2001:db8::1', 'not-an-ip'):
+        with pytest.raises(AutomationError, match='PUBLIC_IP must be the public IPv4 address') as raised:
+            Config.load(profile(tmp_path, PUBLIC_IP=bad))
+        assert bad not in raised.value.message
+    scripts = tmp_path / 'sql_scripts'
+    scripts.mkdir()
+    (scripts / '01.sql').write_text('SELECT 1;', encoding='utf-8')
+    assert main.main(['validate', '--config', str(profile(tmp_path, PUBLIC_IP='8.8.8.8', FIREWALL_RULE_NAME=''))]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output['public_ip_source'] == 'config'
+    assert re.fullmatch(r'lcsjit-[0-9a-f]{8}', output['firewall_rule_name'])
+
+
+def test_public_ip_environment_variable_is_refused_by_name(tmp_path, monkeypatch):
+    monkeypatch.setenv('PUBLIC_IP', '8.8.8.8')
+    with pytest.raises(AutomationError, match='environment variable PUBLIC_IP is not used with config.yaml') as raised:
+        Config.load(profile(tmp_path))
+    assert 'Remove-Item Env:PUBLIC_IP' in raised.value.message
+    assert '8.8.8.8' not in raised.value.message
 
 
 def test_driver_prefers_18_when_both_installed(tmp_path, monkeypatch):

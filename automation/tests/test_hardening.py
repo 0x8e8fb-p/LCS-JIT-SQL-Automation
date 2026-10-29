@@ -31,7 +31,7 @@ def test_download_without_local_config_creates_safe_template_and_stops(tmp_path)
     assert 'Created ' in result.stdout and 'No prerequisites or access changes' in result.stdout
     data = yaml.safe_load((tmp_path / 'config.yaml').read_text())
     assert data == {'ENVIRONMENT_URL': '', 'ACCESS_REASON': 'AX troubleshooting (read-only to AX)',
-                    'ACCESS_DETAILS': '', 'FIREWALL_RULE_NAME': 'lcsjit'}
+                    'ACCESS_DETAILS': '', 'FIREWALL_RULE_NAME': ''}
     config = tmp_path / 'config.yaml'
     before = config.read_bytes()
     result = invoke(tmp_path / 'run.ps1')
@@ -66,7 +66,8 @@ def test_stale_advanced_environment_override_cannot_change_minimal_profile(tmp_p
 
 
 @pytest.mark.parametrize('url', [URL + '&EnvironmentId=', URL + '#fragment',
-                                 URL.replace('11111111-2222-4333-8444-555555555555', 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE')])
+                                 URL.replace('11111111-2222-4333-8444-555555555555', 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE'),
+                                 URL.replace('11111111-2222-4333-8444-555555555555', '11111111222243338444555555555555')])
 def test_noncanonical_environment_identity_refused(tmp_path, url):
     with pytest.raises(AutomationError):
         Config.load(profile(tmp_path, ENVIRONMENT_URL=url))

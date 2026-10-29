@@ -41,18 +41,30 @@ def test_dpapi_protected_local_key_roundtrip(tmp_path):
     assert Fernet(key).decrypt(Fernet(key).encrypt(message)) == message
 
 
-def test_live_environment_config_and_driver():
-    config = Config.load(Path(__file__).resolve().parents[1] / 'config.advanced.yaml')
-    assert config.reason == 'Performance tuning for AX (write to AX)'
-    assert config.details == 'test access'
-    assert config.selectors['rule_name'] == 'test'
-    assert config.browser_timezone == 'UTC'
-    assert config.environment_url.startswith('https://lcs.dynamics.com/V2/EnvironmentDetailsV3New/123456?')
+def test_advanced_reference_profile_is_a_template_until_edited(tmp_path, monkeypatch):
+    reference = Path(__file__).resolve().parents[1] / 'config.advanced.yaml'
+    with pytest.raises(AutomationError, match='ACCESS_DETAILS still contains the REPLACE_ placeholder'):
+        Config.load(reference)
+    import yaml
+    data = yaml.safe_load(reference.read_text(encoding='utf-8'))
+    assert data['LCS_PROJECT_ID'] == '123456' and data['ACCESS_LEVEL'] == 'read_only'
+    assert 'SQL_ODBC_DRIVER' not in data  # Driver choice is automatic unless a profile forces one.
+    data['ACCESS_DETAILS'] = 'Approved validation'
+    edited = tmp_path / 'my-profile.local.yaml'
+    edited.write_text(yaml.safe_dump(data), encoding='utf-8')
+    config = Config.load(edited)
+    assert config.reason == 'AX troubleshooting (read-only to AX)'
+    assert config.selectors['rule_name'].startswith('lcsjit-')
+    assert config.state_path == (tmp_path / '.auth' / 'advanced_profile_auth.enc').resolve()
+    assert config.minimal_profile is False
     from automation_support import Credentials, utcnow
     from datetime import timedelta
     now = utcnow()
     credentials = Credentials('server.database.windows.net', 'AxDB', 'user', 'secret', now, now + timedelta(hours=8))
-    value = connection_string(credentials, config.odbc_driver)
+    assert 'DRIVER={ODBC Driver 18 for SQL Server}' in connection_string(credentials, config.odbc_driver)
+    data['SQL_ODBC_DRIVER'] = 'ODBC Driver 17 for SQL Server'
+    edited.write_text(yaml.safe_dump(data), encoding='utf-8')
+    value = connection_string(credentials, Config.load(edited).odbc_driver)
     assert 'DRIVER={ODBC Driver 17 for SQL Server}' in value
     assert 'Encrypt=yes;TrustServerCertificate=no' in value
 
@@ -122,7 +134,7 @@ def test_expired_matching_rule_is_not_reused():
     instance.open_rule_grid = MagicMock()
     instance.rule_rows = MagicMock(return_value=MagicMock(all=lambda: [row]))
     instance.close_dialog = MagicMock()
-    with pytest.raises(AutomationError, match='expired window'):
+    with pytest.raises(AutomationError, match='Firewall rule test already exists in LCS'):
         instance.enable_rule_grid('8.8.8.8')
     instance.close_dialog.assert_not_called()
 
@@ -150,7 +162,7 @@ def test_browser_grid_add_cleanup_with_stale_modal_layer(tmp_path, monkeypatch):
     import yaml
     profile = tmp_path / 'config.yaml'
     profile.write_text(yaml.safe_dump({
-        'ENVIRONMENT_URL': 'https://lcs.dynamics.com/V2/EnvironmentDetailsV3New/123?EnvironmentId=11111111-2222-4333-8444-555555555555',
+        'ENVIRONMENT_URL': 'https://lcs.dynamics.com/V2/EnvironmentDetailsV3New/123456?EnvironmentId=11111111-2222-4333-8444-555555555555',
         'ACCESS_REASON': 'AX troubleshooting (read-only to AX)',
         'ACCESS_DETAILS': 'Fixture validation', 'FIREWALL_RULE_NAME': 'test',
     }))

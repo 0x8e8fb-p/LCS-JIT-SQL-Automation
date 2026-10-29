@@ -17,6 +17,7 @@ from automation_support import utcnow
 
 ROOT = Path(__file__).resolve().parents[2]
 APP = ROOT / 'automation'
+# The README's example identity; never a real project or environment.
 URL = 'https://lcs.dynamics.com/V2/EnvironmentDetailsV3New/123456?EnvironmentId=11111111-2222-4333-8444-555555555555'
 
 

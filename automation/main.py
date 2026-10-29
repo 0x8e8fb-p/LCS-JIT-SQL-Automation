@@ -199,7 +199,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.check_runtime:
                 check_runtime(config)
             output: dict[str, Any] = {'status': 'success', 'configuration_valid': True, 'total_scripts': len(files), 'live_lcs_validated': False,
-                                      'runtime_checked': args.check_runtime}
+                                      'runtime_checked': args.check_runtime, 'firewall_rule_name': config.selectors.get('rule_name', ''),
+                                      'public_ip_source': config.public_ip_source}
         elif args.command == 'check-auth':
             with sync_playwright() as playwright:
                 adapter = LCSAutomation(config, playwright, config.logs_path / 'auth_check')
