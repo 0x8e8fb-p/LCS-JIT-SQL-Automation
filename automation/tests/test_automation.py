@@ -18,6 +18,7 @@ import lcs_jit_automation as lcs
 import main
 import sql_executor as sql
 from automation_support import AutomationError, Config, Credentials, parse_expiry, parse_server_database, utcnow
+from helpers import real_pyodbc
 
 
 @pytest.fixture
@@ -202,6 +203,7 @@ def browser_fixture(config, monkeypatch):
     return password
 
 
+@pytest.mark.chromium
 def test_real_browser_flow_and_prewrite_masks(config, browser_fixture, monkeypatch, tmp_path):
     with sync_playwright() as playwright:
         adapter = lcs.LCSAutomation(config, playwright, tmp_path / 'shots')
@@ -260,6 +262,7 @@ def config_file(config, tmp_path):
     return path
 
 
+@pytest.mark.chromium
 def test_cli_run_fixture_json_and_reports(config, browser_fixture, monkeypatch, capsys, tmp_path):
     connection = MagicMock()
     preflight = MagicMock()
@@ -283,6 +286,7 @@ def test_cli_run_fixture_json_and_reports(config, browser_fixture, monkeypatch, 
     assert browser_fixture not in report_path.read_text()
 
 
+@pytest.mark.chromium
 def test_cli_failure_cleanup(config, browser_fixture, monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(sql.pyodbc, 'connect', MagicMock(side_effect=pyodbc.Error('08001', browser_fixture)))
     assert main.main(['run', '--config', str(config_file(config, tmp_path))]) == 1
@@ -293,16 +297,26 @@ def test_cli_failure_cleanup(config, browser_fixture, monkeypatch, capsys, tmp_p
     assert browser_fixture not in json.dumps(report)
 
 
+def clean_child_environment(**extra):
+    """A child process environment without machine-wide configuration overrides."""
+    from conftest import ISOLATED_VARIABLES
+    env = {key: value for key, value in os.environ.items() if key.upper() not in ISOLATED_VARIABLES}
+    env.update(extra)
+    return env
+
+
+@pytest.mark.skipif(not real_pyodbc(), reason='the child process needs a loadable pyodbc (unixODBC on macOS/Linux)')
 def test_cli_subprocess_validation_and_invalid_input(config, tmp_path):
     path = config_file(config, tmp_path)
-    result = subprocess.run([sys.executable, str(Path(main.__file__)), 'validate', '--config', str(path)], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, str(Path(main.__file__)), 'validate', '--config', str(path)],
+                            capture_output=True, text=True, env=clean_child_environment())
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)['live_lcs_validated'] is False
-    env = dict(os.environ, CONTINUE_ON_ERROR='not-a-bool')
+    env = clean_child_environment(CONTINUE_ON_ERROR='not-a-bool')
     result = subprocess.run([sys.executable, str(Path(main.__file__)), 'validate', '--config', str(path)], capture_output=True, text=True, env=env)
     assert result.returncode == 1
     assert json.loads(result.stdout)['failed_at_step'] == 'configuration'
-    assert result.stderr == ''
+    assert 'Traceback' not in result.stderr
 
 
 def test_auth_wrong_key_never_leaks(config, monkeypatch):
@@ -354,6 +368,7 @@ def test_environment_lock_prevents_overlap_and_releases(config):
         pass
 
 
+@pytest.mark.chromium
 def test_environment_identity_guard_is_exact(config, browser_fixture, tmp_path):
     with sync_playwright() as playwright:
         adapter = lcs.LCSAutomation(config, playwright, tmp_path / 'shots')

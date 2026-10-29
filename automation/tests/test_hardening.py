@@ -1,5 +1,6 @@
 import json
 import shutil
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -11,13 +12,15 @@ import main
 import sql_executor as sql
 import lcs_jit_automation as lcs
 from automation_support import AutomationError, Config, utcnow
-from test_config import profile, URL
-from test_launcher import ROOT, invoke
-from test_cleanup import make_config, make_adapter
-from test_setup import invoke as invoke_setup, ps_quote
-import sys
+from helpers import ROOT, URL, make_adapter, make_config, profile, ps_quote, real_pyodbc, run_powershell
+from helpers import run_setup_snippet as invoke_setup
 
 
+def invoke(script, *args):
+    return run_powershell(script, *args, cwd=ROOT)
+
+
+@pytest.mark.powershell
 def test_download_without_local_config_creates_safe_template_and_stops(tmp_path):
     shutil.copy2(ROOT / 'run.ps1', tmp_path / 'run.ps1')
     app = tmp_path / 'automation'
@@ -127,6 +130,8 @@ def test_reason_environment_override_is_trimmed(tmp_path, monkeypatch):
     assert Config.load(profile(tmp_path)).access_level == 'read_write'
 
 
+@pytest.mark.powershell
+@pytest.mark.skipif(not real_pyodbc(), reason='the probe imports pyodbc in a child process (needs unixODBC on macOS/Linux)')
 def test_runtime_version_drift_is_detected(tmp_path):
     requirements = tmp_path / 'requirements.txt'
     from importlib.metadata import version
@@ -159,6 +164,7 @@ def test_regional_lcs_hosts_are_supported(tmp_path, host):
     assert c.project_id == '123456'
 
 
+@pytest.mark.chromium
 def test_bootstrap_recovers_from_logon_index_and_saves_session(tmp_path, monkeypatch):
     from playwright.sync_api import sync_playwright
     monkeypatch.setenv('LCS_AUTH_KEY', Fernet.generate_key().decode())
@@ -183,6 +189,7 @@ def test_bootstrap_recovers_from_logon_index_and_saves_session(tmp_path, monkeyp
             adapter.close()
 
 
+@pytest.mark.chromium
 def test_persistent_profile_and_navigate_refresh_saved_auth(tmp_path, monkeypatch):
     from playwright.sync_api import sync_playwright
     monkeypatch.setenv('LCS_AUTH_KEY', Fernet.generate_key().decode())

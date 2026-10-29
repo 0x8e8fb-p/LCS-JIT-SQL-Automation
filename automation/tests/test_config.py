@@ -1,22 +1,17 @@
-from pathlib import Path
+import os
 from dataclasses import replace
 
 import pytest
 import yaml
 
 from automation_support import AutomationError, Config, environment_lock
-
-ROOT = Path(__file__).resolve().parents[2]
-URL = 'https://lcs.dynamics.com/V2/EnvironmentDetailsV3New/123456?EnvironmentId=11111111-2222-4333-8444-555555555555'
+from helpers import ROOT, URL, profile
 
 
-def profile(tmp_path, **overrides):
-    values = {'ENVIRONMENT_URL': URL, 'ACCESS_REASON': 'AX troubleshooting (read-only to AX)',
-              'ACCESS_DETAILS': 'Approved validation', 'FIREWALL_RULE_NAME': 'validation'}
-    values.update(overrides)
-    path = tmp_path / 'config.yaml'
-    path.write_text(yaml.safe_dump(values))
-    return path
+def test_machine_configuration_variables_do_not_leak_into_tests():
+    # conftest removes machine-wide overrides such as a LOGS_PATH set by other software.
+    for key in ('LOGS_PATH', 'PUBLIC_IP', 'ENVIRONMENT_URL', 'LCS_AUTH_KEY'):
+        assert key not in os.environ
 
 
 def test_minimal_config_derives_internal_values(tmp_path, monkeypatch):

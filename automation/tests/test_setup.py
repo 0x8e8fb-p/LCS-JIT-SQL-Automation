@@ -1,28 +1,17 @@
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
+import platform
 import sys
-from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-POWERSHELL = shutil.which('powershell') or shutil.which('pwsh')
+from helpers import ps_quote, run_setup_snippet
 
-
-def ps_quote(value):
-    return "'" + str(value).replace("'", "''") + "'"
+pytestmark = pytest.mark.powershell
 
 
 def invoke(tmp_path, body):
-    if not POWERSHELL:
-        pytest.skip('PowerShell is not installed on this platform')
-    script = tmp_path / 'verify.ps1'
-    script.write_text("$ErrorActionPreference = 'Stop'\n. " + ps_quote(ROOT / 'automation/setup.ps1') + '\n' + body)
-    return subprocess.run([POWERSHELL, '-NoLogo', '-NoProfile', '-File', str(script)],
-                          capture_output=True, text=True, timeout=45)
+    return run_setup_snippet(tmp_path, body)
 
 
 def test_expected_probe_failure_does_not_abort_setup(tmp_path):
@@ -41,7 +30,8 @@ Write-Output 'probe-returned-false'
 
 
 @pytest.mark.parametrize('fresh', [True, False])
-@pytest.mark.skipif(os.name != 'nt', reason='Windows-only automatic prerequisite setup')
+@pytest.mark.windows('exercises the real Windows x64 platform guard')
+@pytest.mark.skipif(platform.machine().lower() not in {'amd64', 'x86_64'}, reason='x64 only: the setup guard refuses ARM64 by design')
 def test_setup_first_run_and_repeat_are_idempotent(tmp_path, fresh):
     app = tmp_path / 'app with spaces'
     app.mkdir()

@@ -1,32 +1,8 @@
 import json
-from unittest.mock import MagicMock
 
 import main
-from automation_support import AutomationError, utcnow
-
-
-def make_config():
-    config = MagicMock()
-    config.disable_access_after = True
-    config.environment_id = 'UAT'
-    config.access_level = 'read_only'
-    return config
-
-
-def make_adapter(error):
-    adapter = MagicMock()
-    adapter.ip_rule_attempted = True
-    adapter.screenshot.return_value = None
-    adapter.disable_ip.side_effect = error
-    credentials = MagicMock()
-    credentials.requested_at = utcnow()
-    credentials.expires_at = utcnow()
-    credentials.username = 'reader'
-    credentials.server = 'test.database.windows.net'
-    credentials.database = 'AxDB'
-    credentials.password = 'SQL_SECRET'
-    adapter.request_access.return_value = credentials
-    return adapter
+from automation_support import AutomationError
+from helpers import make_adapter, make_config
 
 
 def run_with(monkeypatch, tmp_path, error):

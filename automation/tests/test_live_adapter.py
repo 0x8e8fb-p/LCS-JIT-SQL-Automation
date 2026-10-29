@@ -139,6 +139,7 @@ def test_safe_click_never_bypasses_browser_actionability():
     button.evaluate.assert_not_called()
 
 
+@pytest.mark.chromium
 def test_browser_grid_add_cleanup_with_stale_modal_layer(tmp_path, monkeypatch):
     import json
     from datetime import timedelta
