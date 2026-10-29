@@ -141,3 +141,22 @@ def test_sign_in_without_an_interactive_console_is_explained(monkeypatch, error)
     with pytest.raises(AutomationError, match='interactive console') as raised:
         lcs.wait_for_enter('Press Enter')
     assert raised.value.step == 'authentication'
+
+
+def test_rotation_keeps_old_files_when_the_new_key_cannot_be_protected(tmp_path, windows_user):
+    state, key = tmp_path / 'state.enc', tmp_path / 'key.dpapi'
+    lcs.save_auth(context(), state, key)
+    windows_user['user'], windows_user['protect_error'] = 'bob', 5
+    with pytest.raises(AutomationError, match='DPAPI error 5'):
+        lcs.save_auth(context(), state, key)
+    assert key.exists() and state.exists()
+    assert list(tmp_path.glob('*.stale-*')) == []
+
+
+def test_a_key_created_by_another_run_is_shared_not_overwritten(tmp_path, windows_user):
+    key = tmp_path / 'key.dpapi'
+    first = lcs.protected_local_key(key, create=True)
+    assert lcs._create_key(key) == first  # lost the race: reuses the existing key
+    assert lcs.protected_local_key(key) == first
+    assert lcs.write_atomic(key, b'other', 'sign-in key', exclusive=True) is False
+    assert lcs.protected_local_key(key) == first

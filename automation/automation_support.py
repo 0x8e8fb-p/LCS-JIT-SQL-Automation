@@ -239,8 +239,10 @@ LCS_FORMATS = _lcs_formats()
 
 
 def date_shape(text: str) -> str:
-    """Digits and letters masked: enough to recognize a format, nothing more."""
-    return re.sub(r'[A-Za-z]', 'a', re.sub(r'\d', '9', text))[:40]
+    """Digits as 9, letters as a, date punctuation kept, anything else as ?."""
+    shape = ''.join('9' if char.isdigit() else 'a' if char.isascii() and char.isalpha() else
+                    char if char in ' /.:,-' else '?' for char in text)
+    return shape[:40]
 
 
 def normalize_display_date(text: str) -> str:
@@ -251,35 +253,46 @@ def normalize_display_date(text: str) -> str:
     return value
 
 
-def parse_lcs_datetime(text: str, now: datetime, preferred: str = '') -> tuple[datetime, str, bool] | None:
-    """(UTC datetime, style, ambiguous) for an LCS display date; None if no format matches.
+def parse_lcs_datetime(text: str, now: datetime, preferred: str = '', *, conservative: bool = False) -> tuple[datetime, str, str] | None:
+    """(UTC datetime, style, order evidence) for an LCS display date; None if no format matches.
 
-    Several readings (day/month order) are narrowed to those no later than
-    now + 36 h; a known page style breaks ties, otherwise the latest remaining
-    reading wins. Raises ValueError if every reading is implausibly far ahead.
+    A date such as 10/7/2026 reads as 7 October (month first) or 10 July (day
+    first). Readings later than now + 36 h are implausible for LCS (8-hour
+    lifetimes) and dropped. Then, for a row created by this run, a known page
+    order or else the latest reading wins (the swapped reading is weeks away).
+    For rows that existed before the run (conservative), the earliest reading
+    wins, so a leftover is never mistaken for a valid one. Order evidence is
+    returned only when a single day/month order matched (17/10, not 6/6).
+    Raises ValueError when every reading is implausibly far ahead.
     """
     value = normalize_display_date(text)
     candidates: dict[datetime, str] = {}
+    orders: set[str] = set()
     for style, pattern in LCS_FORMATS:
         try:
             parsed = datetime.strptime(value, pattern).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
         candidates.setdefault(parsed, style)
+        orders.add(date_order(style))
     if not candidates:
         return None
+    evidence = next(iter(orders)) if len(orders) == 1 else ''
     if len(candidates) == 1:
         moment, style = next(iter(candidates.items()))
-        return moment, style, False
+        return moment, style, evidence
     plausible = {moment: style for moment, style in candidates.items() if moment <= now + EXPIRY_HORIZON}
     if not plausible:
         raise ValueError('ambiguous date with no plausible reading')
+    if conservative:
+        earliest = min(plausible)
+        return earliest, plausible[earliest], evidence
     if preferred:
         same_order = [moment for moment, style in plausible.items() if date_order(style) == date_order(preferred)]
         if len(same_order) == 1:
-            return same_order[0], plausible[same_order[0]], True
+            return same_order[0], plausible[same_order[0]], evidence
     latest = max(plausible)
-    return latest, plausible[latest], True
+    return latest, plausible[latest], evidence
 
 
 def date_order(style: str) -> str:
@@ -519,9 +532,10 @@ class Config:
             problems.append('the selected ACCESS_REASON grants read-only access, so ACCESS_LEVEL must be read_only')
         if reason in READ_WRITE_REASONS and level and level != 'read_write':
             problems.append('the selected ACCESS_REASON grants write access, so ACCESS_LEVEL must be read_write')
+        rule_field = 'FIREWALL_RULE_NAME' if 'FIREWALL_RULE_NAME' in data else 'selectors.rule_name'
         rule_name = text('FIREWALL_RULE_NAME') if 'FIREWALL_RULE_NAME' in data else selectors.get('rule_name', '')
         if rule_name and not RULE_NAME.fullmatch(rule_name):
-            problems.append('FIREWALL_RULE_NAME must be 1-64 letters, digits, underscores or hyphens, starting with a letter or digit (or blank for this computer\'s default)')
+            problems.append(f'{rule_field} must be 1-64 letters, digits, underscores or hyphens, starting with a letter or digit (or blank for this computer\'s default)')
         # Blank: a per-computer, per-user name, so machines sharing an environment never collide.
         selectors['rule_name'] = rule_name or default_rule_name()
         if selectors.get('expiry_format', '') not in {'', 'iso8601', 'lcs_utc'}:

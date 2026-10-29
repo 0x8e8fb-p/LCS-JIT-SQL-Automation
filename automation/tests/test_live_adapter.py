@@ -134,6 +134,7 @@ def test_expired_matching_rule_is_not_reused():
     instance.open_rule_grid = MagicMock()
     instance.rule_rows = MagicMock(return_value=MagicMock(all=lambda: [row]))
     instance.close_dialog = MagicMock()
+    instance.wait_rows_settled = MagicMock(return_value=1)
     with pytest.raises(AutomationError, match='Firewall rule test already exists in LCS'):
         instance.enable_rule_grid('8.8.8.8')
     instance.close_dialog.assert_not_called()

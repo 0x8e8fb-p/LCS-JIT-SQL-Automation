@@ -22,7 +22,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwright, Error as BrowserError
 
 from automation_support import (AutomationError, Config, Credentials, LCS_HOSTS, browser_category, date_shape, default_rule_name, describe_error, parse_expiry,
-                                parse_lcs_datetime, parse_server_database, timestamp, utcnow)
+                                parse_lcs_datetime, parse_server_database, safe_file_name, timestamp, utcnow)
 
 BROWSER_CHANNEL = 'chromium'  # Full Chromium for headless and visible runs (no headless shell).
 BROWSER_LOCALE = 'en-US'
@@ -30,6 +30,9 @@ BROWSER_LAUNCH_TIMEOUT_MS = 120000  # First start can be slow while security sof
 
 LCS_URL = 'https://lcs.dynamics.com'
 MASK_CHARACTERS = {'*', '•', '●'}
+# Visible only on interactive sign-in pages (Entra and common federated forms), never on auto-submit hops.
+SIGN_IN_PROMPT = ('input[type=password]:visible, input[type=email]:visible, input[name=loginfmt]:visible, input[name=otc]:visible, '
+                  '#idSIButton9:visible, #tilesHolder:visible, [data-test-id=accountList]:visible, #idDiv_SAOTCAS_Title:visible')
 
 
 def is_masked(value: str) -> bool:
@@ -96,11 +99,13 @@ def _error_code(error: OSError) -> object:
     return getattr(error, 'winerror', None) or error.errno or 'unknown'
 
 
-def write_atomic(path: Path, data: bytes, what: str) -> None:
-    """Write via a unique temporary file and an atomic replace.
+def write_atomic(path: Path, data: bytes, what: str, *, exclusive: bool = False) -> bool:
+    """Write via a unique temporary file and an atomic rename.
 
-    Antivirus, backup or OneDrive can hold the target briefly, so the replace is
-    retried. A failure never leaves a partial or empty file behind.
+    Antivirus, backup or OneDrive can hold the target briefly, so a replace is
+    retried. exclusive: never replace an existing file; returns False when one
+    already existed (another run created it first). A failure never leaves a
+    partial or empty file behind.
     """
     temporary = path.with_name(f'{path.name}.{uuid.uuid4().hex}.tmp')
     try:
@@ -109,16 +114,26 @@ def write_atomic(path: Path, data: bytes, what: str) -> None:
         with temporary.open('xb') as handle:
             handle.write(data)
         os.chmod(temporary, 0o600)
+        if exclusive:
+            try:
+                if os.name == 'nt':
+                    os.rename(temporary, path)  # Windows: fails when the target exists.
+                else:
+                    os.link(temporary, path)  # POSIX rename would overwrite.
+                return True
+            except FileExistsError:
+                return False
         delay = 0.2
         for attempt in range(5):
             try:
                 os.replace(temporary, path)
-                return
+                return True
             except PermissionError:
                 if attempt == 4:
                     raise
                 time.sleep(delay)
                 delay *= 2
+        return True
     except OSError as error:
         raise AutomationError('auth_state_write', f'Cannot save the {what} (error {_error_code(error)}). Antivirus, backup software or OneDrive '
                               'may be locking automation/.auth; exclude that folder or move the project out of OneDrive, then retry.') from None
@@ -129,14 +144,19 @@ def write_atomic(path: Path, data: bytes, what: str) -> None:
             pass  # Never hide the primary result; a leftover *.tmp holds only ciphertext.
 
 
-def _create_key(path: Path) -> bytes:
-    key = Fernet.generate_key()
+def _protect(key: bytes) -> bytes:
     try:
-        blob = _dpapi(key, True)  # Protect first: nothing is written if DPAPI fails.
+        return _dpapi(key, True)
     except DpapiError as error:
         raise AutomationError('auth_state_write', f'Windows could not protect the sign-in key (DPAPI error {error.code}). Sign in from a normal '
                               'interactive Windows session; for Task Scheduler use "Run whether user is logged on or not" with the password stored.') from None
-    write_atomic(path, blob, 'sign-in key')
+
+
+def _create_key(path: Path) -> bytes:
+    key = Fernet.generate_key()
+    blob = _protect(key)  # Protect first: nothing is written if DPAPI fails.
+    if not write_atomic(path, blob, 'sign-in key', exclusive=True):
+        return protected_local_key(path)  # Another run created the key first; share it.
     return key
 
 
@@ -151,7 +171,8 @@ def protected_local_key(path: Path, *, create: bool = False) -> bytes:
     try:
         blob = path.read_bytes()
     except OSError as error:
-        raise AutomationError('authentication', f'The saved sign-in key cannot be read (error {_error_code(error)}). Check permissions on automation/.auth '
+        # Not 'authentication': signing in again cannot fix an unreadable file.
+        raise AutomationError('auth_state_write', f'The saved sign-in key cannot be read (error {_error_code(error)}). Check permissions on automation/.auth '
                               'and that antivirus or OneDrive is not locking it.') from None
     try:
         key = _dpapi(blob, False) if blob else b''
@@ -185,16 +206,20 @@ def save_auth(context: BrowserContext, path: Path, key_path: Path | None = None)
         fernet = cipher(key_path, create=True)
     except UnreadableKey:
         # A key from another Windows user/computer (or a damaged one) can never be
-        # decrypted here. Keep it and the old state for inspection, then start over.
+        # decrypted here. Protect a new key first, then keep the old files for
+        # inspection, so a DPAPI failure cannot leave the folder without a key.
+        assert key_path is not None
+        new_key = Fernet.generate_key()
+        blob = _protect(new_key)
         stamp = utcnow().strftime('%Y%m%dT%H%M%SZ')
         for item in (key_path, path):
-            if item is not None and item.exists():
+            if item.exists():
                 try:
                     item.replace(item.with_name(f'{item.name}.stale-{stamp}'))
                 except OSError as error:
-                    raise AutomationError('auth_state_write', f'Cannot set aside the unreadable sign-in file {item.name} (error {_error_code(error)}). '
+                    raise AutomationError('auth_state_write', f'Cannot set aside the unreadable sign-in file {safe_file_name(item)} (error {_error_code(error)}). '
                                           'Close other runs and check permissions on automation/.auth.') from None
-        fernet = cipher(key_path, create=True)
+        fernet = Fernet(new_key) if write_atomic(key_path, blob, 'sign-in key', exclusive=True) else cipher(key_path)
         rotated = True
     encrypted = fernet.encrypt(json.dumps(context.storage_state(indexed_db=True)).encode('utf-8'))
     write_atomic(path, encrypted, 'encrypted sign-in state')
@@ -213,8 +238,11 @@ def load_auth(path: Path, key_path: Path | None = None) -> StorageState:
     except InvalidToken:
         raise AutomationError('authentication', 'The saved sign-in could not be decrypted (it was saved by another Windows user, computer or LCS_AUTH_KEY). '
                               f'{SIGN_IN_AGAIN}') from None
-    except (OSError, ValueError):
-        raise AutomationError('authentication', f'The saved sign-in file is unreadable or damaged. {SIGN_IN_AGAIN}') from None
+    except OSError as error:
+        raise AutomationError('auth_state_write', f'The saved sign-in file cannot be read (error {_error_code(error)}). Check permissions on automation/.auth '
+                              'and that antivirus or OneDrive is not locking it.') from None
+    except ValueError:
+        raise AutomationError('authentication', f'The saved sign-in file is damaged. {SIGN_IN_AGAIN}') from None
 
 
 def wait_for_enter(prompt: str) -> None:
@@ -321,7 +349,7 @@ class LCSAutomation:
         """Specific, secret-free reason why Chromium did not start."""
         category = str(describe_error(error).get('browser', ''))
         if category == 'profile_in_use':
-            folder = f' ({profile_dir.name})' if profile_dir is not None else ''
+            folder = f' ({safe_file_name(profile_dir)})' if profile_dir is not None else ''
             return (f'The saved browser profile{folder} is in use by another Chromium window. Close browser windows opened by this tool '
                     '(or end chrome.exe processes started from automation/browsers) and retry.')
         if category == 'executable_missing':
@@ -488,6 +516,13 @@ class LCSAutomation:
         return AutomationError('authentication', f'The saved sign-in needs a fresh login (the browser was sent to {shown}). '
                                'Run .\\run.cmd and complete sign-in when asked, or .\\run.cmd -ForceInteractive.')
 
+    def _sign_in_prompt_visible(self) -> bool:
+        """An interactive sign-in page (user name, password, code, account picker, stay signed in)."""
+        try:
+            return self.page.locator(SIGN_IN_PROMPT).count() > 0
+        except BrowserError:
+            return False  # Navigating: not a settled prompt.
+
     def _slow_section(self, what: str) -> AutomationError:
         seconds = self.NAVIGATION_TIMEOUT_MS / 1000
         return AutomationError('environment', f'{what} did not appear within {seconds:g} s. LCS may be slow (retry), or your account may lack '
@@ -514,7 +549,8 @@ class LCSAutomation:
                     pass  # The page is navigating.
             else:
                 off_lcs_since = now if off_lcs_since is None else off_lcs_since
-                if (now - off_lcs_since) * 1000 >= self.SIGN_IN_GRACE_MS:
+                # A page that only auto-submits back to LCS (form_post) shows no prompt.
+                if (now - off_lcs_since) * 1000 >= self.SIGN_IN_GRACE_MS and (problem.step != 'authentication' or self._sign_in_prompt_visible()):
                     raise problem
             if now >= deadline:
                 if problem is not None:
@@ -576,14 +612,16 @@ class LCSAutomation:
                 raise
             except BrowserError as error:
                 problem = self._landing_problem()
-                if problem is not None:
-                    # Federated or expired sign-in: fail fast instead of retrying a login page.
+                if problem is not None and (problem.step != 'authentication' or self._sign_in_prompt_visible()):
+                    # A sign-in prompt or another LCS host: fail fast instead of retrying.
                     if allow_interactive_auth and problem.step == 'authentication':
                         self.bootstrap(navigate_first=False)
                         self.screenshot('01_login')
                         return
                     raise problem from None
                 category = browser_category(error) or 'other'
+                if category == 'timeout' and not self.page.url.startswith(('http://', 'https://')):
+                    category = 'net::ERR_TIMED_OUT'  # Nothing loaded at all: LCS is unreachable.
                 if category.startswith('net::ERR_'):
                     if attempt < 2:
                         time.sleep(2 ** attempt)
@@ -601,6 +639,9 @@ class LCSAutomation:
                     time.sleep(2 ** attempt)
         if self._on_lcs():
             raise self._slow_section('The Database accounts section of the environment page')
+        problem = self._landing_problem()
+        if problem is not None and not allow_interactive_auth:
+            raise problem
         if allow_interactive_auth:
             self.bootstrap(navigate_first=False)
             self.screenshot('01_login')
@@ -710,26 +751,34 @@ class LCSAutomation:
         self.wait_idle()
         self.verify_environment()
 
-    def wait_rows_settled(self, dialog: Locator) -> int:
-        """Rows are bound when their count stops changing (empty grids must stay empty longer)."""
+    def wait_rows_settled(self, dialog: Locator, stable_ms: float | None = None) -> int:
+        """Rows are bound when their count stops changing.
+
+        Default: three equal reads for a non-empty grid, GRID_EMPTY_SETTLE_MS for an
+        empty one. stable_ms: the count (any) must stay unchanged that long, used
+        before concluding that a rule is absent.
+        """
         rows = self.rule_rows(dialog)
         started = time.monotonic()
         last = -1
         same = 0
-        empty_since: float | None = None
+        unchanged_since = started
         while True:
             count = rows.count()
-            same = same + 1 if count == last else 0
-            last = count
             now = time.monotonic()
-            if count > 0:
-                empty_since = None
-                if same >= self.GRID_SETTLE_POLLS - 1:
-                    return count
+            if count == last:
+                same += 1
             else:
-                empty_since = now if empty_since is None else empty_since
-                if (now - empty_since) * 1000 >= self.GRID_EMPTY_SETTLE_MS:
-                    return 0
+                same, unchanged_since = 0, now
+            last = count
+            unchanged_ms = (now - unchanged_since) * 1000
+            if stable_ms is not None:
+                if unchanged_ms >= stable_ms:
+                    return count
+            elif count > 0 and same >= self.GRID_SETTLE_POLLS - 1:
+                return count
+            elif count == 0 and unchanged_ms >= self.GRID_EMPTY_SETTLE_MS:
+                return 0
             if (now - started) * 1000 >= self.GRID_SETTLE_TIMEOUT_MS:
                 raise AutomationError(self.step, f'The firewall rules grid kept changing for {self.GRID_SETTLE_TIMEOUT_MS / 1000:g} s; '
                                       'nothing was changed. Retry when LCS is less busy.')
@@ -751,12 +800,16 @@ class LCSAutomation:
         self.wait_rows_settled(dialog)
         return dialog
 
-    def expiry_value(self, text: str, step: str | None = None, now: datetime | None = None) -> datetime:
-        """UTC expiry from an LCS cell; fails closed instead of guessing validity."""
+    def expiry_value(self, text: str, step: str | None = None, now: datetime | None = None, *, conservative: bool = False) -> datetime:
+        """UTC expiry from an LCS cell; fails closed instead of guessing validity.
+
+        conservative: the row existed before this run, so an ambiguous day/month
+        resolves to the earlier reading (a leftover is never taken as valid).
+        """
         step = step or str(getattr(self, 'step', 'jit_request'))
         if self.config.selectors.get('expiry_format') == 'lcs_utc':
             try:
-                parsed = parse_lcs_datetime(text, now or utcnow(), getattr(self, 'date_order_hint', ''))
+                parsed = parse_lcs_datetime(text, now or utcnow(), getattr(self, 'date_order_hint', ''), conservative=conservative)
             except ValueError:
                 raise AutomationError(step, f'LCS showed an ambiguous expiry date ({date_shape(text)}) that cannot be read safely. '
                                       'Set the LCS language to English (United States) in your LCS user settings and rerun; '
@@ -765,11 +818,11 @@ class LCSAutomation:
                 raise AutomationError(step, f'LCS showed an expiry date in an unrecognized format ({date_shape(text)}). '
                                       'Set the LCS language to English (United States) in your LCS user settings and rerun; '
                                       'the run refuses to guess credential or firewall validity.')
-            moment, style, ambiguous = parsed
+            moment, style, order = parsed
             if not getattr(self, 'lcs_date_format', ''):
                 self.lcs_date_format = style  # Reported as lcs_date_format in report.json.
-            if not ambiguous:
-                self.date_order_hint = style  # Resolves later ambiguous dates on the same page.
+            if order:
+                self.date_order_hint = order  # Only from dates such as 17/10 that show the order.
             return moment
         try:
             return parse_expiry(text)
@@ -802,20 +855,43 @@ class LCSAutomation:
             raise AutomationError(step, f'More than one firewall rule is named {self.rule_name}; refusing to change or remove any of them.')
         return matches
 
+    def is_owned_row(self, row: Locator) -> bool:
+        return (row.locator("input[name='NetworkSecurityRuleName']").input_value() == self.rule_name
+                and row.locator("input[name='NetworkSecurityRuleIpOrCidr']").input_value() in {self.public_ip, self.public_ip + '/32'}
+                and row.locator("input[name='NetworkSecurityGroupService']").input_value() == 'AzureSQL')
+
+    def owned_rows_after_full_settle(self, dialog: Locator) -> list[Locator]:
+        """This run's rule; absence counts only after the grid stayed unchanged for the long window."""
+        matches = self.matching_owned_rows(dialog, 'cleanup')
+        if not matches:
+            self.wait_rows_settled(dialog, stable_ms=self.GRID_EMPTY_SETTLE_MS)
+            matches = self.matching_owned_rows(dialog, 'cleanup')
+        return matches
+
+    def reusable_rule_expiry(self, dialog: Locator, public_ip: str) -> datetime | None:
+        """Expiry of an unexpired AzureSQL rule for this IP that already exists (never owned)."""
+        for row in self.rule_rows(dialog).all():
+            source = row.locator("input[name='NetworkSecurityRuleIpOrCidr']").input_value()
+            service = row.locator("input[name='NetworkSecurityGroupService']").input_value()
+            if source in {public_ip, public_ip + '/32'} and service == 'AzureSQL':
+                expiry = self.expiry_value(row.locator("input[name='NetworkSecurityGroupRuleExpiration']").input_value(), 'ip_rule', conservative=True)
+                if expiry > utcnow():  # An expired entry provides no access and must not be reused.
+                    return expiry
+        return None
+
     def enable_rule_grid(self, public_ip: str) -> None:
         dialog = self.open_rule_grid()
         with self.ui('Reading the firewall rules grid', self.ACTION_TIMEOUT_MS):
-            for row in self.rule_rows(dialog).all():
-                source = row.locator("input[name='NetworkSecurityRuleIpOrCidr']").input_value()
-                service = row.locator("input[name='NetworkSecurityGroupService']").input_value()
-                if source in {public_ip, public_ip + '/32'} and service == 'AzureSQL':
-                    expiry = self.expiry_value(row.locator("input[name='NetworkSecurityGroupRuleExpiration']").input_value(), 'ip_rule')
-                    if expiry <= utcnow():
-                        continue # An expired entry provides no access and must not be reused.
-                    self.firewall_expires_at = min(self.firewall_expires_at, expiry)
-                    self.close_dialog(dialog)
-                    self.screenshot('02_existing_ip_rule')
-                    return # Existing rule is NOT owned and will never be deleted.
+            expiry = self.reusable_rule_expiry(dialog, public_ip)
+            if expiry is None:
+                # Late-bound rows must not lead to a duplicate rule: wait for the long window, then look again.
+                self.wait_rows_settled(dialog, stable_ms=self.GRID_EMPTY_SETTLE_MS)
+                expiry = self.reusable_rule_expiry(dialog, public_ip)
+            if expiry is not None:
+                self.firewall_expires_at = min(self.firewall_expires_at, expiry)
+                self.close_dialog(dialog)
+                self.screenshot('02_existing_ip_rule')
+                return # Existing rule is NOT owned and will never be deleted.
             desired_name = self.config.selectors.get('rule_name', '') or default_rule_name()
             for row in self.rule_rows(dialog).all():
                 if row.locator("input[name='NetworkSecurityRuleName']").input_value() == desired_name:
@@ -870,23 +946,24 @@ class LCSAutomation:
         # This also recovers cleanup after a failed add-dialog transition.
         self.refresh_environment()
         dialog = self.open_rule_grid()
-        matches = self.matching_owned_rows(dialog, 'cleanup')
+        matches = self.owned_rows_after_full_settle(dialog)
         if not matches:
             self.close_dialog(dialog)
-            # A fresh, settled grid has confirmed absence (including natural expiry).
+            # A fresh grid that stayed unchanged confirms absence (including natural expiry).
             self.rule_created = False
             return
+        self.wait_idle()  # Nothing may be pending between the identity check and the click.
         with self.ui(f'Selecting firewall rule {self.rule_name}', self.ACTION_TIMEOUT_MS, manual):
             for row in self.rule_rows(dialog).all():
                 checkbox = row.get_by_role('checkbox')
                 if checkbox.get_attribute('aria-checked') == 'true':
                     checkbox.click() # Only clears UI selection; never deletes other rows.
-            checkbox = matches[0].get_by_role('checkbox')
-            checkbox.click()
-            selected = dialog.locator(".rowTemplate:not(.place-holder) [role='checkbox'][aria-checked='true']")
-            if selected.count() != 1 or checkbox.get_attribute('aria-checked') != 'true':
-                raise AutomationError('cleanup', 'Could not exclusively select owned firewall rule; refusing deletion.')
-            self.safe_click(self.locator('rule_delete', scope=dialog))
+            matches[0].get_by_role('checkbox').click()
+            selected = dialog.locator(".rowTemplate:not(.place-holder):has([role='checkbox'][aria-checked='true'])")
+            if selected.count() != 1 or not self.is_owned_row(selected.first):
+                raise AutomationError('cleanup', f'Could not exclusively select firewall rule {self.rule_name}; refusing deletion. {manual}')
+            # Plain click immediately after re-checking the selected row's name, IP and service.
+            self.locator('rule_delete', scope=dialog).click()
         confirmation = self.page.get_by_role('dialog').filter(has=self.page.get_by_role('button', name='Yes', exact=True))
         try:
             confirmation.first.wait_for(state='visible', timeout=self.CONFIRM_TIMEOUT_MS)
@@ -901,7 +978,7 @@ class LCSAutomation:
         # Verify server state after a full refresh, not a stale in-place grid.
         self.refresh_environment()
         fresh = self.open_rule_grid()
-        if self.matching_owned_rows(fresh, 'cleanup'):
+        if self.owned_rows_after_full_settle(fresh):
             raise AutomationError('cleanup', f'Owned rule still present in freshly opened grid; deletion not confirmed. {manual}')
         self.close_dialog(fresh)
         self.rule_created = False
@@ -916,7 +993,7 @@ class LCSAutomation:
             return locator.input_value().strip()
         return locator.inner_text().strip()
 
-    def extract(self, old_rows: set[tuple[str, str, str, str]], requested_at: datetime) -> Credentials | None:
+    def extract(self, old_rows: set[tuple[str, str, str]], requested_at: datetime) -> Credentials | None:
         accounts = self.locator('accounts')
         candidates: list[Credentials] = []
         for row in self.locator('rows', scope=accounts).all():
@@ -929,8 +1006,9 @@ class LCSAutomation:
             username = self.cell_value(self.locator('username', scope=row))
             expiry_text = self.cell_value(self.locator('expires_at', scope=row))
             password = self.cell_value(self.locator('password', scope=row))
-            # In-memory snapshot prevents silently reusing an unchanged old credential.
-            if (server_db, username, expiry_text, password) in old_rows:
+            # Rows present before the request are never used, even if their password
+            # was still masked when the snapshot was taken.
+            if (server_db, username, expiry_text) in old_rows:
                 continue
             if not password or is_masked(password):
                 continue
@@ -946,15 +1024,13 @@ class LCSAutomation:
         self.verify_environment()
         self.wait_idle()
         accounts = self.locator('accounts')
-        old_rows: set[tuple[str, str, str, str]] = set()
+        old_rows: set[tuple[str, str, str]] = set()
         with self.ui('Reading the existing database accounts', self.ACTION_TIMEOUT_MS, 'Nothing was requested.'):
             for row in self.locator('rows', scope=accounts).all():
-                self.reveal_password(row)
                 old_rows.add((
                     self.cell_value(self.locator('server_database', scope=row)),
                     self.cell_value(self.locator('username', scope=row)),
                     self.cell_value(self.locator('expires_at', scope=row)),
-                    self.cell_value(self.locator('password', scope=row)),
                 ))
         with self.ui('The Request access form (reason and details)', self.ACTION_TIMEOUT_MS,
                      'Nothing was requested; check that your account can request database access for this environment.'):

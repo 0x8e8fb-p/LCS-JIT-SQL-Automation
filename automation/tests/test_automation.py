@@ -227,7 +227,7 @@ def test_real_browser_flow_and_prewrite_masks(config, browser_fixture, monkeypat
             assert adapter.extract(set(), credentials.requested_at).username == 'reader'
             latest_expiry = adapter.page.locator('.expiry').first.inner_text()
             server_db = adapter.page.locator('.server-db').first.inner_text()
-            excluded = {(server_db, 'reader', latest_expiry, browser_fixture)}
+            excluded = {(server_db, 'reader', latest_expiry)}
             assert adapter.extract(excluded, credentials.requested_at).username == 'older'
             # Browser screenshot bytes were actually written. Probe accounts pixels in
             # the browser canvas from the saved PNG; no extra image library required.

@@ -103,3 +103,20 @@ def test_browser_is_pinned_to_en_us_and_utc(tmp_path, monkeypatch, persistent):
     assert facts['language'] == 'en-US'
     assert facts['zone'] in {'UTC', 'Etc/UTC'}
     assert parse_lcs_datetime(facts['sample'].replace(',', ''), NOW)[0] == utc(2026, 10, 7, 16, 12)
+
+
+def test_rows_that_existed_before_the_run_resolve_to_the_earlier_reading():
+    # US page: 5/6 is 6 May (expired). Read on 5 June it must not become "valid until 16:12 today".
+    june_fifth = datetime(2026, 6, 5, 10, 0, tzinfo=timezone.utc)
+    assert parse_lcs_datetime('5/6/2026 4:12 PM', june_fifth)[0] == utc(2026, 6, 5, 16, 12)  # new row: latest
+    assert parse_lcs_datetime('5/6/2026 4:12 PM', june_fifth, conservative=True)[0] == utc(2026, 5, 6, 16, 12)
+    instance = adapter()
+    assert instance.expiry_value('5/6/2026 4:12 PM', 'ip_rule', june_fifth, conservative=True) <= june_fifth
+
+
+def test_symmetric_dates_do_not_teach_a_day_month_order():
+    instance = adapter()
+    instance.expiry_value('6/6/2026 4:12 PM', now=NOW)
+    assert instance.date_order_hint == ''
+    instance.expiry_value('10/17/2026 4:12 PM', now=NOW)
+    assert instance.date_order_hint == 'month_first'

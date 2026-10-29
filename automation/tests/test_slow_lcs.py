@@ -178,7 +178,8 @@ def test_federated_sign_in_redirect_fails_fast_as_authentication(tmp_path, monke
         instance = lcs.LCSAutomation(config, playwright, tmp_path / 'logs')
         instance.context.route('https://lcs.dynamics.com/**', lambda r: r.fulfill(
             content_type='text/html', body="<script>location.href='https://adfs.contoso.example/adfs/ls/?wa=signin'</script>"))
-        instance.context.route('https://adfs.contoso.example/**', lambda r: r.fulfill(content_type='text/html', body='<form>Sign in</form>'))
+        instance.context.route('https://adfs.contoso.example/**', lambda r: r.fulfill(
+            content_type='text/html', body='<form>Sign in <input type="email" name="UserName"><input type="password"></form>'))
         started = time.monotonic()
         try:
             with pytest.raises(AutomationError) as raised:
@@ -214,3 +215,66 @@ def test_silent_single_sign_on_hop_is_not_mistaken_for_expired_login(tmp_path, m
             instance.close()
     assert config.environment_id == 'contoso-sandbox'
     assert state['lcs_requests'] == 2
+
+
+def test_slow_auto_submit_hop_longer_than_the_grace_still_succeeds(tmp_path, monkeypatch):
+    # An identity page that only posts back to LCS (form_post) shows no prompt.
+    fast_lcs_timings(monkeypatch, SIGN_IN_GRACE_MS=800)
+    config = make_config(tmp_path, monkeypatch)
+    state = {'lcs_requests': 0}
+
+    def lcs_route(request_route):
+        state['lcs_requests'] += 1
+        body = ("<script>location.href='https://login.microsoftonline.com/common/oauth2/authorize'</script>" if state['lcs_requests'] == 1
+                else f'{HEADING}<section id="x_ManageEnvironmentSection">Database Accounts</section>')
+        request_route.fulfill(content_type='text/html', body=body)
+
+    hop = '<form id="f"></form><script>setTimeout(()=>location.href=' + json.dumps(config.environment_url) + ',2500)</script>'
+    with sync_playwright() as playwright:
+        instance = lcs.LCSAutomation(config, playwright, tmp_path / 'logs')
+        instance.context.route('https://lcs.dynamics.com/**', lcs_route)
+        instance.context.route('https://login.microsoftonline.com/**', lambda r: r.fulfill(content_type='text/html', body=hop))
+        try:
+            instance.navigate()
+        finally:
+            instance.close()
+    assert config.environment_id == 'contoso-sandbox'
+
+
+def test_unanswered_lcs_is_reported_as_network_not_sign_in(tmp_path, monkeypatch):
+    fast_lcs_timings(monkeypatch)
+    monkeypatch.setattr(lcs.LCSAutomation, 'NAVIGATION_TIMEOUT_MS', 800)
+    monkeypatch.setattr(lcs.time, 'sleep', lambda _: None)
+    config = make_config(tmp_path, monkeypatch)
+    with sync_playwright() as playwright:
+        instance = lcs.LCSAutomation(config, playwright, tmp_path / 'logs')
+        instance.context.route('https://lcs.dynamics.com/**', lambda route: None)  # never answered
+        try:
+            with pytest.raises(AutomationError) as raised:
+                instance.navigate()
+        finally:
+            instance.close()
+    assert raised.value.step == 'network'  # not 'authentication': signing in again cannot help
+    assert 'LCS could not be reached (net::ERR_' in raised.value.message
+
+
+def test_cleanup_refuses_when_another_row_ends_up_selected(tmp_path, monkeypatch):
+    # Simulates the grid rebinding between selection and Delete.
+    fast_lcs_timings(monkeypatch)
+    config = make_config(tmp_path, monkeypatch)
+    state = {'adds': 0, 'deletes': 0, 'rule': True}
+    other = rule_row('someone-else', ip='9.9.9.9').replace('onclick="this.setAttribute', 'id="other" onclick="this.setAttribute')
+    ours = rule_row('validation').replace(
+        'onclick="this.setAttribute(\'aria-checked\', this.getAttribute(\'aria-checked\')===\'true\'?\'false\':\'true\')"',
+        'onclick="document.querySelector(\'#other\').setAttribute(\'aria-checked\',\'true\')"')
+    with sync_playwright() as playwright:
+        instance = lcs.LCSAutomation(config, playwright, tmp_path / 'logs')
+        serve(instance, state, lambda: grid_page(other + ours))
+        try:
+            instance.navigate()
+            instance.public_ip, instance.rule_name, instance.ip_rule_attempted = '8.8.8.8', 'validation', True
+            with pytest.raises(AutomationError, match='Could not exclusively select firewall rule validation'):
+                instance.disable_ip()
+        finally:
+            instance.close()
+    assert state['deletes'] == 0
