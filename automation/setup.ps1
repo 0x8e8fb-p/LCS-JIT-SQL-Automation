@@ -263,62 +263,156 @@ function Get-Download {
     }
 }
 
-function Test-SupportedPython {
-    param([string]$Executable, [string[]]$Prefix = @())
-    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { return $false }
-    # PowerShell 5 turns redirected native stderr into ErrorRecords. An expected
-    # failed probe must return false, not abort automatic installation.
-    $Result = Invoke-Native -FilePath $Executable -Arguments (@($Prefix) + @('-c', 'import sys, struct; sys.exit(0 if (3,10) <= sys.version_info[:2] < (3,14) and struct.calcsize(''P'') == 8 else 1)')) -Quiet
-    return ($Result.ExitCode -eq 0)
+# ---- Project Python: CPython from the official nuget.org package -------------
+# The package is a plain ZIP: no installer, no Installed apps entry, no registry
+# or PATH change. Size and SHA-512 come from the nuget.org catalog entry
+# https://api.nuget.org/v3/catalog0/data/2026.09.30.20.50.40/python.3.13.16.json
+$script:PythonVersion = '3.13.16'
+$script:PythonPackageName = 'python.3.13.16.nupkg'
+$script:PythonPackageUrl = 'https://api.nuget.org/v3-flatcontainer/python/3.13.16/python.3.13.16.nupkg'
+$script:PythonPackageSize = 14817881
+$script:PythonPackageSha512 = 'TGEhuRTpWtRifDR4r/GEhmg/cGMqtwB4kOCkt1QhXnCmdDE3Dict3iLJI1xrsNSRbXGyCwLEhe6qa5Rd2s376w=='
+
+function New-ShortId { return [Guid]::NewGuid().ToString('N').Substring(0, 8) }
+
+function Convert-Base64ToHex {
+    param([string]$Base64)
+    return ([BitConverter]::ToString([Convert]::FromBase64String($Base64))).Replace('-', '')
 }
 
-function Get-RegistryPythonCandidates {
-    $Candidates = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($Root in @('HKCU:\Software\Python\PythonCore', 'HKLM:\Software\Python\PythonCore')) {
-        foreach ($Version in @('3.13', '3.12', '3.11', '3.10')) {
-            $Key = Join-Path $Root "$Version\InstallPath"
-            if (-not (Test-Path -LiteralPath $Key)) { continue }
-            $Props = Get-ItemProperty -LiteralPath $Key -ErrorAction SilentlyContinue
-            if ($null -eq $Props) { continue }
-            # A normal registration records the same interpreter twice (ExecutablePath
-            # and the InstallPath default); probe each path only once.
-            if ($Props.PSObject.Properties['ExecutablePath'] -and $Props.ExecutablePath) {
-                $Executable = [string]$Props.ExecutablePath
-                if (-not $Candidates.Contains($Executable)) { $Candidates.Add($Executable) }
-            }
-            if ($Props.PSObject.Properties['(default)'] -and $Props.'(default)') {
-                $FromDefault = Join-Path ([string]$Props.'(default)') 'python.exe'
-                if (-not $Candidates.Contains($FromDefault)) { $Candidates.Add($FromDefault) }
-            }
-        }
-    }
-    return $Candidates
+function Test-PythonPackageFile {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    if ((Get-Item -LiteralPath $Path).Length -ne $script:PythonPackageSize) { return $false }
+    return ((Get-FileHash -LiteralPath $Path -Algorithm SHA512).Hash -eq (Convert-Base64ToHex $script:PythonPackageSha512))
 }
 
-function Find-SupportedPython {
+function Get-PythonPackage {
+    <# A pre-staged package in runtime\installers is used when its hash matches (offline/blocked networks). #>
     param([string]$AppDir)
-    $Local = Join-Path $AppDir 'runtime/python/python.exe'
-    if (Test-SupportedPython $Local) { return $Local }
-    # Avoid Windows Store aliases, which can open a Store window rather than run.
-    $Python = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($Python -and $Python.Source -notmatch '[\\/]WindowsApps[\\/]' -and (Test-SupportedPython $Python.Source)) {
-        return $Python.Source
+    $Package = Join-Path $AppDir ('runtime/installers/' + $script:PythonPackageName)
+    if (Test-PythonPackageFile $Package) { return $Package }
+    if (Test-Path -LiteralPath $Package) {
+        Write-Host "Ignoring automation\runtime\installers\$($script:PythonPackageName): it does not match the published SHA-512."
+        Remove-Item -LiteralPath $Package -Force
     }
-    $Launcher = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($Launcher) {
-        foreach ($Version in @('-3.13', '-3.12', '-3.11', '-3.10')) {
-            if (Test-SupportedPython $Launcher.Source @($Version)) {
-                $Result = Invoke-Native -FilePath $Launcher.Source -Arguments @($Version, '-c', 'import sys; print(sys.executable)') -Quiet
-                if ($Result.ExitCode -eq 0) { return ($Result.Tail | Select-Object -Last 1) }
+    Write-Host "Downloading Python $($script:PythonVersion) (14.8 MB) from nuget.org..."
+    Get-Download -Url $script:PythonPackageUrl -Destination $Package | Out-Null
+    if (-not (Test-PythonPackageFile $Package)) {
+        Remove-Item -LiteralPath $Package -Force -ErrorAction SilentlyContinue
+        throw ("The downloaded Python package does not match the published size and SHA-512; nothing was installed. Retry on a trusted network, " +
+               "or download $($script:PythonPackageUrl) yourself and place it in automation\runtime\installers.")
+    }
+    return $Package
+}
+
+function Expand-PythonPackage {
+    <# Extracts only tools\ from the package; refuses entries that would land outside the folder. #>
+    param([string]$Package, [string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $Root = [IO.Path]::GetFullPath($Destination).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    [IO.Directory]::CreateDirectory($Root) | Out-Null
+    $Zip = [IO.Compression.ZipFile]::OpenRead($Package)
+    try {
+        foreach ($Entry in $Zip.Entries) {
+            $Name = [Uri]::UnescapeDataString($Entry.FullName.Replace('\', '/'))
+            if (-not $Name.StartsWith('tools/') -or $Name.EndsWith('/')) { continue }
+            $Relative = $Name.Substring(6)
+            $Target = [IO.Path]::GetFullPath([IO.Path]::Combine($Root, $Relative))
+            if (-not $Target.StartsWith($Root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "The Python package contains an unsafe path ($Name); nothing was installed."
             }
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Target)) | Out-Null
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($Entry, $Target, $true)
         }
-    }
-    foreach ($Candidate in (Get-RegistryPythonCandidates)) {
-        if ($Candidate -notmatch '[\\/]WindowsApps[\\/]' -and (Test-SupportedPython $Candidate)) {
-            return $Candidate
+    } finally { $Zip.Dispose() }
+}
+
+function Test-RuntimePython {
+    param([string]$Python)
+    if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { return $false }
+    $Probe = "import sys, struct, ssl, ctypes, venv, ensurepip, sqlite3; sys.exit(0 if sys.version.split()[0] == '$($script:PythonVersion)' and struct.calcsize('P') == 8 else 1)"
+    return ((Invoke-Native -FilePath $Python -Arguments @('-I', '-c', $Probe) -Quiet).ExitCode -eq 0)
+}
+
+function Test-RuntimeMarker {
+    param([string]$Runtime)
+    $Marker = Join-Path $Runtime '.lcsjit-runtime.json'
+    if (-not (Test-Path -LiteralPath $Marker -PathType Leaf)) { return $false }
+    try { $Data = [IO.File]::ReadAllText($Marker) | ConvertFrom-Json } catch { return $false }
+    return ($null -ne $Data.PSObject.Properties['version'] -and $Data.version -eq $script:PythonVersion -and
+            $null -ne $Data.PSObject.Properties['sha512'] -and $Data.sha512 -eq $script:PythonPackageSha512)
+}
+
+function Initialize-RuntimePython {
+    <# Marked, working runtime: reused without network access. Otherwise extracted, probed, then swapped in. #>
+    param([string]$AppDir)
+    $Runtime = Join-Path $AppDir 'runtime/python'
+    $Python = Join-Path $Runtime 'python.exe'
+    if ((Test-RuntimeMarker $Runtime) -and (Test-RuntimePython $Python)) { return $Python }
+    $Package = Get-PythonPackage -AppDir $AppDir
+    $Staging = Join-Path $AppDir ('runtime/python.new-' + (New-ShortId))
+    try {
+        Write-Host "Installing Python $($script:PythonVersion) into automation\runtime\python (no installer, registry or PATH changes)..."
+        Expand-PythonPackage -Package $Package -Destination $Staging
+        if (-not (Test-RuntimePython (Join-Path $Staging 'python.exe'))) {
+            throw ("The extracted Python $($script:PythonVersion) does not start. Security software may block programs in automation\runtime; " +
+                   'ask IT to allow it. Nothing was replaced.')
         }
+        $Marker = @{ version = $script:PythonVersion; sha512 = $script:PythonPackageSha512; source = $script:PythonPackageUrl } | ConvertTo-Json
+        [IO.File]::WriteAllText((Join-Path $Staging '.lcsjit-runtime.json'), $Marker)
+        if (Test-Path -LiteralPath $Runtime) {
+            $Old = Join-Path $AppDir ('runtime/python.old-' + (New-ShortId))
+            Write-Host "Keeping the previous automation\runtime\python as $(Split-Path -Leaf $Old)."
+            Move-Item -LiteralPath $Runtime -Destination $Old
+        }
+        Move-Item -LiteralPath $Staging -Destination $Runtime
+    } finally {
+        if (Test-Path -LiteralPath $Staging) { Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue }
     }
-    return $null
+    return $Python
+}
+
+function Test-VenvMatches {
+    <# The environment must belong to this runtime, in this folder, with this Python version. #>
+    param([string]$Venv, [string]$RuntimeHome)
+    $Config = Join-Path $Venv 'pyvenv.cfg'
+    $Python = Join-Path $Venv 'Scripts/python.exe'
+    if (-not (Test-Path -LiteralPath $Config -PathType Leaf) -or -not (Test-Path -LiteralPath $Python -PathType Leaf)) { return $false }
+    $Values = @{}
+    foreach ($Line in [IO.File]::ReadAllLines($Config)) {
+        $Index = $Line.IndexOf('=')
+        if ($Index -gt 0) { $Values[$Line.Substring(0, $Index).Trim().ToLowerInvariant()] = $Line.Substring($Index + 1).Trim() }
+    }
+    if (-not $Values.ContainsKey('home') -or -not $Values.ContainsKey('version')) { return $false }
+    try {
+        $VenvHome = [IO.Path]::GetFullPath($Values['home']).TrimEnd('\', '/')
+        $Expected = [IO.Path]::GetFullPath($RuntimeHome).TrimEnd('\', '/')
+    } catch { return $false }
+    if (-not $VenvHome.Equals($Expected, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if ($Values['version'] -ne $script:PythonVersion) { return $false }
+    $Probe = "import sys; sys.exit(0 if sys.version.split()[0] == '$($script:PythonVersion)' else 1)"
+    return ((Invoke-Native -FilePath $Python -Arguments @('-I', '-c', $Probe) -Quiet).ExitCode -eq 0)
+}
+
+function Initialize-Venv {
+    <# Rebuilt when the Python version or the project folder changed; the old one is kept as a backup. #>
+    param([string]$AppDir, [string]$RuntimePython)
+    $Venv = Join-Path $AppDir '.venv'
+    $Python = Join-Path $Venv 'Scripts/python.exe'
+    $RuntimeHome = Split-Path -Parent $RuntimePython
+    if (Test-VenvMatches -Venv $Venv -RuntimeHome $RuntimeHome) { return $Python }
+    if (Test-Path -LiteralPath $Venv) {
+        $Backup = $Venv + '.backup-' + (New-ShortId)
+        Write-Host "Rebuilding automation\.venv for Python $($script:PythonVersion) in this folder; the previous one is kept as $(Split-Path -Leaf $Backup)."
+        Move-Item -LiteralPath $Venv -Destination $Backup
+    }
+    Write-Host 'Creating isolated Python environment...'
+    Invoke-PythonStep $RuntimePython @('-I', '-m', 'venv', $Venv) 'Could not create the local Python environment (automation\.venv).'
+    if (-not (Test-VenvMatches -Venv $Venv -RuntimeHome $RuntimeHome)) {
+        throw 'The new Python environment (automation\.venv) does not start. Security software may block it; ask IT to allow automation\.venv.'
+    }
+    return $Python
 }
 
 function Get-VerifiedInstaller {
@@ -348,123 +442,6 @@ function Invoke-SetupProcess {
         throw "Installation requires a restart. Restart Windows and rerun .\run.cmd. Log: $LogPath"
     }
     if ($Process.ExitCode -ne 0) { throw "Installer failed (exit $($Process.ExitCode)). Log: $LogPath" }
-}
-
-function Unpack-PythonInstaller {
-    param([string]$Installer, [string]$Target, [string]$Cache)
-    $Bytes = [IO.File]::ReadAllBytes($Installer)
-    $CabOffset = -1
-    $CabSize = 0
-    $Pos = 0
-    while ($Pos -le $Bytes.Length - 28) {
-        $Idx = [Array]::IndexOf($Bytes, [byte]0x4D, $Pos)
-        if ($Idx -lt 0 -or $Idx -gt $Bytes.Length - 28) { break }
-        if ($Bytes[$Idx + 1] -eq 0x53 -and $Bytes[$Idx + 2] -eq 0x43 -and $Bytes[$Idx + 3] -eq 0x46 -and
-            $Bytes[$Idx + 4] -eq 0x00 -and $Bytes[$Idx + 5] -eq 0x00 -and $Bytes[$Idx + 6] -eq 0x00 -and $Bytes[$Idx + 7] -eq 0x00 -and
-            $Bytes[$Idx + 24] -eq 3 -and $Bytes[$Idx + 25] -eq 1) {
-            $Size = [BitConverter]::ToInt32($Bytes, $Idx + 8)
-            if ($Size -gt 10000000 -and ($Idx + $Size) -le $Bytes.Length) {
-                $CabOffset = $Idx
-                $CabSize = $Size
-                break
-            }
-        }
-        $Pos = $Idx + 1
-    }
-    if ($CabOffset -lt 0) { throw "Could not locate attached MSI container in $Installer" }
-    $WorkDir = Join-Path $Cache 'python-unpack'
-    if (Test-Path -LiteralPath $WorkDir) { Remove-Item -LiteralPath $WorkDir -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-    try {
-        $CabPath = Join-Path $WorkDir 'attached.cab'
-        $Stream = [IO.File]::Open($CabPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $Stream.Write($Bytes, $CabOffset, $CabSize) } finally { $Stream.Dispose() }
-        $Expand = Join-Path $env:SystemRoot 'System32/expand.exe'
-        $MsiExec = Join-Path $env:SystemRoot 'System32/msiexec.exe'
-        $Payloads = @(
-            @{ Id = 'a0'; Name = 'core.msi' },
-            @{ Id = 'a2'; Name = 'exe.msi' },
-            @{ Id = 'a4'; Name = 'dev.msi' },
-            @{ Id = 'a6'; Name = 'lib.msi' }
-        )
-        foreach ($Payload in $Payloads) {
-            $Expanded = Invoke-Native -FilePath $Expand -Arguments @($CabPath, ("-F:{0}" -f $Payload.Id), $WorkDir) -Quiet
-            if ($Expanded.ExitCode -ne 0) { throw "Failed to extract $($Payload.Name) from Python installer." }
-            # Payload ids are taken from the verified 3.13.16 amd64 container layout.
-            # Refuse anything that is not an installable MSI (OLE2/compound file) rather
-            # than handing an unexpected file to msiexec after a layout change.
-            $Extracted = Join-Path $WorkDir $Payload.Id
-            $Header = New-Object byte[] 8
-            $Stream = [IO.File]::OpenRead($Extracted)
-            try { $Read = $Stream.Read($Header, 0, $Header.Length) } finally { $Stream.Dispose() }
-            if ($Read -ne 8 -or [BitConverter]::ToString($Header) -ne 'D0-CF-11-E0-A1-B1-1A-E1') {
-                throw "The Python installer's attached container no longer matches the verified payload layout: $($Payload.Id) is not the expected $($Payload.Name) package."
-            }
-            $MsiPath = Join-Path $WorkDir $Payload.Name
-            Move-Item -LiteralPath $Extracted -Destination $MsiPath -Force
-            $MsiLog = Join-Path $Cache ("python-admin-$($Payload.Name).log")
-            Invoke-SetupProcess -Executable $MsiExec -LogPath $MsiLog -Arguments @(
-                '/a', ('"{0}"' -f $MsiPath), '/qn', '/norestart',
-                ('TARGETDIR="{0}"' -f $Target), '/L*v', ('"{0}"' -f $MsiLog)
-            )
-        }
-    }
-    finally {
-        Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Install-LocalPython {
-    param([string]$AppDir)
-    $Cache = Join-Path $AppDir 'runtime/installers'
-    $Target = Join-Path $AppDir 'runtime/python'
-    $Python = Join-Path $Target 'python.exe'
-    Write-Host 'Installing Python 3.13.16 into automation/runtime/python (no PATH changes)...'
-    $Installer = Get-VerifiedInstaller `
-        -Url 'https://www.python.org/ftp/python/3.13.16/python-3.13.16-amd64.exe' `
-        -Destination (Join-Path $Cache 'python-3.13.16-amd64.exe') `
-        -Publisher 'O=Python Software Foundation(?:,|$)' `
-        -Sha256 'fb4f9f5d438b2396da0086dc70b935c530cb578e37adc6d354f7ad2037fee83b'
-    # Preferred path: extract the attached MSI container from the verified download.
-    # An administrative install writes only files under TargetDir. It creates no
-    # Windows Installer product, no ARP (Apps > Installed apps) entry and no PATH or
-    # PEP 514 registry entry, so deleting or moving the project folder cannot leave a
-    # stale Python 3.13 registration behind. Such a registration makes every later run
-    # a no-op Modify whose /uninstall fails (for example 1603 from pip.msi) because
-    # python.exe is missing at the recorded InstallDirectory.
-    $ExtractError = $null
-    try {
-        Unpack-PythonInstaller -Installer $Installer -Target $Target -Cache $Cache
-    }
-    catch { $ExtractError = $_.Exception.Message }
-    if (Test-SupportedPython $Python) { return $Python }
-    # Fallback for hosts where MSI administrative installation is blocked: the official
-    # per-user bundle installer. It registers a per-user 'Python 3.13.16 (64-bit)'
-    # entry, so remove it through Settings > Installed apps (or its recorded uninstall
-    # command) before deleting or moving the project folder.
-    Write-Host 'Local extraction did not produce an interpreter; using the official installer (registers a per-user Python entry)...'
-    if ($ExtractError) { Write-Host "Local extraction failed: $ExtractError" }
-    $Log = Join-Path $Cache 'python-install.log'
-    $InstallArgs = @(
-        '/quiet', '/norestart', 'InstallAllUsers=0', 'PrependPath=0', 'Include_launcher=0',
-        'Include_test=0', 'Include_doc=0', 'Include_tcltk=0', 'Include_pip=1', 'AssociateFiles=0', 'Shortcuts=0',
-        ('TargetDir="{0}"' -f $Target), '/log', ('"{0}"' -f $Log)
-    )
-    $InstallError = $null
-    try {
-        Invoke-SetupProcess -Executable $Installer -LogPath $Log -Arguments $InstallArgs
-    }
-    catch {
-        # A required restart still stops the run.
-        if ($_.Exception.Message -match 'requires a restart') { throw }
-        $InstallError = $_.Exception.Message
-    }
-    if (Test-SupportedPython $Python) { return $Python }
-    $Found = Find-SupportedPython $AppDir
-    if ($Found) { return $Found }
-    $Details = @($ExtractError, $InstallError) | Where-Object { $_ }
-    if ($Details) { throw "Python installation did not produce a usable x64 interpreter. $($Details -join ' ') Log: $Log" }
-    throw "Python installation did not produce a usable x64 interpreter. Log: $Log"
 }
 
 function Test-SqlDriver {
@@ -522,19 +499,8 @@ function Initialize-Prerequisites {
     Start-SetupLog -AppDir $AppDir
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Set-ChildEnvironment -AppDir $AppDir
-    $Py = Join-Path $AppDir '.venv/Scripts/python.exe'
-    if (-not (Test-SupportedPython $Py)) {
-        $BasePython = Find-SupportedPython $AppDir
-        if (-not $BasePython) { $BasePython = Install-LocalPython $AppDir }
-        $Venv = Join-Path $AppDir '.venv'
-        if (Test-Path -LiteralPath $Venv) {
-            # Preserve an unusable/copied environment instead of deleting it.
-            Move-Item -LiteralPath $Venv -Destination ($Venv + '.backup-' + [Guid]::NewGuid().ToString('N'))
-        }
-        Write-Host 'Creating isolated Python environment...'
-        Invoke-PythonStep $BasePython @('-m', 'venv', $Venv) 'Could not create the local Python environment.'
-        if (-not (Test-SupportedPython $Py)) { throw 'The new Python environment is not usable.' }
-    }
+    $RuntimePython = Initialize-RuntimePython -AppDir $AppDir
+    $Py = Initialize-Venv -AppDir $AppDir -RuntimePython $RuntimePython
     $Requirements = Join-Path $AppDir 'requirements.txt'
     $Stamp = Join-Path $AppDir '.venv/requirements.sha256'
     $Hash = (Get-FileHash -LiteralPath $Requirements -Algorithm SHA256).Hash

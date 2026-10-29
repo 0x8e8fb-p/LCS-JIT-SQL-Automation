@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 
 import pytest
@@ -43,41 +44,39 @@ $script:Browser = ${str(not fresh).lower()}
 $script:Calls = New-Object 'System.Collections.Generic.List[string]'
 $App = {ps_quote(app)}
 function Assert-SetupReady {{ param($AppDir) $script:Calls.Add('preflight') }}
-function Test-SupportedPython {{ param($Executable, $Prefix) return $script:Ready }}
-function Find-SupportedPython {{ param($AppDir) $script:Calls.Add('find'); return $null }}
-function Install-LocalPython {{ param($AppDir) $script:Calls.Add('python'); return 'fake-python' }}
+function Test-DownloadAccess {{ param($AppDir) }}
+function Initialize-RuntimePython {{ param($AppDir) if (-not $script:Ready) {{ $script:Calls.Add('python') }}; return 'runtime-python.exe' }}
+function Initialize-Venv {{
+    param($AppDir, $RuntimePython)
+    if (-not $script:Ready) {{ $script:Calls.Add('venv'); $script:Ready = $true }}
+    New-Item -ItemType Directory -Force -Path (Join-Path $AppDir '.venv') | Out-Null
+    return (Join-Path $AppDir '.venv/Scripts/python.exe')
+}}
 function Test-PythonPackages {{ param($Python) return $script:Packages }}
 function Test-SqlDriver {{ param($Python) return $script:Driver }}
 function Install-SqlDriver {{ param($AppDir) $script:Calls.Add('odbc'); $script:Driver=$true }}
 function Test-Chromium {{ param($Python) return $script:Browser }}
 function Invoke-PythonStep {{
     param($Python, $Arguments, $Failure)
-    if ($Arguments[1] -eq 'venv') {{
-        $script:Calls.Add('venv'); $script:Ready=$true
-        New-Item -ItemType Directory -Force -Path $Arguments[2] | Out-Null
-    }} elseif ($Arguments[1] -eq 'pip' -and $Arguments[2] -eq 'install') {{
-        $script:Calls.Add('pip-install'); $script:Packages=$true
-    }} elseif ($Arguments[1] -eq 'pip') {{ $script:Calls.Add('pip-check') }}
-    elseif ($Arguments[1] -eq 'playwright') {{ $script:Calls.Add('chromium'); $script:Browser=$true }}
+    if ($Arguments -contains 'install' -and $Arguments -contains 'pip') {{ $script:Calls.Add('pip-install'); $script:Packages=$true }}
+    elseif ($Arguments -contains 'check') {{ $script:Calls.Add('pip-check') }}
+    elseif ($Arguments -contains 'playwright') {{ $script:Calls.Add('chromium'); $script:Browser=$true }}
 }}
-New-Item -ItemType Directory -Path (Join-Path $App '.venv') | Out-Null
 if ($script:Ready) {{
+    New-Item -ItemType Directory -Force -Path (Join-Path $App '.venv') | Out-Null
     Set-Content -LiteralPath (Join-Path $App '.venv/requirements.sha256') -Value (Get-FileHash (Join-Path $App 'requirements.txt')).Hash
 }}
 $first = Initialize-Prerequisites -AppDir $App
 $second = Initialize-Prerequisites -AppDir $App
 if ($first -ne $second -or $first -notlike '*python.exe') {{ throw 'Incorrect Python return value' }}
 Write-Output ('calls=' + ($script:Calls -join ','))
-Write-Output ('backups=' + @(Get-ChildItem -LiteralPath $App -Directory -Force -Filter '.venv.backup-*').Count)
 '''
     result = invoke(tmp_path, body)
     assert result.returncode == 0, result.stdout + result.stderr
     if fresh:
-        assert 'calls=preflight,find,python,venv,pip-install,pip-check,odbc,chromium,preflight,pip-check' in result.stdout
-        assert 'backups=1' in result.stdout
+        assert 'calls=preflight,python,venv,pip-install,pip-check,odbc,chromium,preflight,pip-check' in result.stdout
     else:
         assert 'calls=preflight,pip-check,preflight,pip-check\n' in result.stdout
-        assert 'backups=0' in result.stdout
 
 
 @pytest.mark.parametrize(('code', 'expected'), [(0, 'ok'), (3010, 'requires a restart'),
@@ -124,217 +123,6 @@ catch {{ Write-Output $_.Exception.Message; exit 1 }}
 ''')
     assert result.returncode == 1
     assert 'Dependency step failed' in result.stdout
-
-
-def test_find_supported_python_discovers_registry_install_when_not_on_path(tmp_path):
-    reg_python = tmp_path / 'previous_folder' / 'runtime' / 'python' / 'python.exe'
-    reg_python.parent.mkdir(parents=True)
-    reg_python.write_text('fake-python')
-    result = invoke(tmp_path, f'''
-function Get-Command {{ param($Name, $ErrorAction) return $null }}
-function Get-RegistryPythonCandidates {{ return @({ps_quote(reg_python)}) }}
-function Test-SupportedPython {{ param($Executable, $Prefix) return ($Executable -eq {ps_quote(reg_python)}) }}
-$found = Find-SupportedPython -AppDir {ps_quote(tmp_path / 'new_app')}
-if ($found -ne {ps_quote(reg_python)}) {{ throw "Unexpected found: $found" }}
-Write-Output "found=$found"
-''')
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert f'found={reg_python}' in result.stdout
-
-
-def test_install_local_python_extracts_without_windows_installer_registration(tmp_path):
-    # A per-user Python registration that outlives the project folder breaks the next
-    # install (no-op Modify, then 1603 from pip.msi on uninstall), so the preferred
-    # path only extracts files and must never run the official installer.
-    app = tmp_path / 'new_app'
-    target_py = app / 'runtime' / 'python' / 'python.exe'
-    result = invoke(tmp_path, f'''
-$script:Steps = New-Object 'System.Collections.Generic.List[string]'
-function Get-VerifiedInstaller {{
-    param($Url, $Destination, $Publisher, $Sha256)
-    New-Item -ItemType Directory -Force -Path (Split-Path $Destination) | Out-Null
-    Set-Content -LiteralPath $Destination -Value 'fake-installer'
-    return $Destination
-}}
-function Find-SupportedPython {{ param($AppDir) return $null }}
-function Test-SupportedPython {{
-    param($Executable, $Prefix)
-    return ($Executable -eq {ps_quote(target_py)} -and (Test-Path -LiteralPath $Executable))
-}}
-function Invoke-SetupProcess {{
-    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
-    $script:Steps.Add('official-installer')
-}}
-function Unpack-PythonInstaller {{
-    param($Installer, $Target, $Cache)
-    $script:Steps.Add('unpack')
-    New-Item -ItemType Directory -Force -Path (Split-Path {ps_quote(target_py)}) | Out-Null
-    Set-Content -LiteralPath {ps_quote(target_py)} -Value 'usable-python'
-}}
-$py = Install-LocalPython -AppDir {ps_quote(app)}
-if ($py -ne {ps_quote(target_py)}) {{ throw "Unexpected python: $py" }}
-Write-Output ('steps=' + ($script:Steps -join ','))
-''')
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert 'steps=unpack' in result.stdout
-
-
-def test_install_local_python_falls_back_to_official_installer_when_extraction_fails(tmp_path):
-    # Blocked MSI administrative installation falls back to the registered per-user
-    # installer instead of failing the run.
-    app = tmp_path / 'new_app'
-    target_py = app / 'runtime' / 'python' / 'python.exe'
-    result = invoke(tmp_path, f'''
-$script:Steps = New-Object 'System.Collections.Generic.List[string]'
-function Get-VerifiedInstaller {{
-    param($Url, $Destination, $Publisher, $Sha256)
-    New-Item -ItemType Directory -Force -Path (Split-Path $Destination) | Out-Null
-    Set-Content -LiteralPath $Destination -Value 'fake-installer'
-    return $Destination
-}}
-function Find-SupportedPython {{ param($AppDir) return $null }}
-function Test-SupportedPython {{
-    param($Executable, $Prefix)
-    return ($Executable -eq {ps_quote(target_py)} -and (Test-Path -LiteralPath $Executable))
-}}
-function Invoke-SetupProcess {{
-    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
-    $script:Steps.Add('official-installer')
-    New-Item -ItemType Directory -Force -Path (Split-Path {ps_quote(target_py)}) | Out-Null
-    Set-Content -LiteralPath {ps_quote(target_py)} -Value 'registered-python'
-}}
-function Unpack-PythonInstaller {{
-    param($Installer, $Target, $Cache)
-    $script:Steps.Add('unpack')
-    throw 'MSI administrative installation is blocked by policy.'
-}}
-$py = Install-LocalPython -AppDir {ps_quote(app)}
-if ($py -ne {ps_quote(target_py)}) {{ throw "Unexpected python: $py" }}
-Write-Output ('steps=' + ($script:Steps -join ','))
-''')
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert 'steps=unpack,official-installer' in result.stdout
-    assert 'Local extraction failed: MSI administrative installation is blocked by policy.' in result.stdout
-
-
-def test_install_local_python_restart_requirement_stops_instead_of_extracting(tmp_path):
-    app = tmp_path / 'new_app'
-    result = invoke(tmp_path, f'''
-$script:Steps = New-Object 'System.Collections.Generic.List[string]'
-function Get-VerifiedInstaller {{
-    param($Url, $Destination, $Publisher, $Sha256)
-    New-Item -ItemType Directory -Force -Path (Split-Path $Destination) | Out-Null
-    Set-Content -LiteralPath $Destination -Value 'fake-installer'
-    return $Destination
-}}
-function Find-SupportedPython {{ param($AppDir) return $null }}
-function Test-SupportedPython {{ param($Executable, $Prefix) return $false }}
-function Invoke-SetupProcess {{
-    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
-    throw "Installation requires a restart. Restart Windows and rerun ./run.ps1. Log: python-install.log"
-}}
-function Unpack-PythonInstaller {{
-    param($Installer, $Target, $Cache)
-    $script:Steps.Add('unpack')
-}}
-try {{ Install-LocalPython -AppDir {ps_quote(app)}; throw 'Restart requirement ignored' }}
-catch {{
-    if ($_.Exception.Message -eq 'Restart requirement ignored') {{ throw }}
-    Write-Output $_.Exception.Message
-}}
-Write-Output ('steps=' + ($script:Steps -join ','))
-''')
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert 'requires a restart' in result.stdout
-    # Extraction produced no interpreter, so the run still stops instead of
-    # continuing with the unrelated discovery fallback.
-    assert 'steps=unpack' in result.stdout
-    assert 'find' not in result.stdout
-
-
-def test_unpack_python_installer_extracts_attached_msi_container(tmp_path):
-    import struct
-    installer = tmp_path / 'fake-python.exe'
-    cab_bytes = bytearray(10_000_064)
-    cab_bytes[0:8] = b'MSCF\x00\x00\x00\x00'
-    struct.pack_into('<I', cab_bytes, 8, 10_000_032)
-    cab_bytes[24] = 3
-    cab_bytes[25] = 1
-    installer.write_bytes(b'MZ' + b'\x00' * 126 + bytes(cab_bytes))
-    target_dir = tmp_path / 'target'
-    cache_dir = tmp_path / 'cache'
-    cache_dir.mkdir()
-    result = invoke(tmp_path, f'''
-$script:Msis = New-Object 'System.Collections.Generic.List[string]'
-$FakeBin = Join-Path {ps_quote(tmp_path)} 'fake-sys/System32'
-New-Item -ItemType Directory -Force -Path $FakeBin | Out-Null
-Set-Content -LiteralPath (Join-Path $FakeBin 'expand.exe') -Value ''
-$env:SystemRoot = Join-Path {ps_quote(tmp_path)} 'fake-sys'
-Set-Alias -Name (Join-Path $FakeBin 'expand.exe') -Value Invoke-FakeExpand
-function Invoke-FakeExpand {{
-    param($Cab, $Flag, $WorkDir)
-    if ((Get-Item -LiteralPath $Cab).Length -ne 10000032) {{ throw 'Unexpected CAB length' }}
-    $Id = $Flag -replace '^-F:', ''
-    [IO.File]::WriteAllBytes((Join-Path $WorkDir $Id), [byte[]](0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1,0x00,0x00))
-    $global:LASTEXITCODE = 0
-}}
-function Invoke-SetupProcess {{
-    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
-    $MsiPath = $Arguments[1] -replace '"', ''
-    if (-not (Test-Path -LiteralPath $MsiPath)) {{ throw "Missing extracted MSI: $MsiPath" }}
-    $script:Msis.Add([IO.Path]::GetFileName($MsiPath))
-}}
-Unpack-PythonInstaller -Installer {ps_quote(installer)} -Target {ps_quote(target_dir)} -Cache {ps_quote(cache_dir)}
-if (Test-Path -LiteralPath (Join-Path {ps_quote(cache_dir)} 'python-unpack')) {{ throw 'WorkDir not cleaned up' }}
-Write-Output ('msis=' + ($script:Msis -join ','))
-''')
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert 'msis=core.msi,exe.msi,dev.msi,lib.msi' in result.stdout
-
-
-def test_unpack_python_installer_rejects_unexpected_container_payload(tmp_path):
-    # Payload ids come from the verified 3.13.16 amd64 layout; a layout change must
-    # fail loudly instead of feeding a wrong file to msiexec.
-    import struct
-    installer = tmp_path / 'fake-python.exe'
-    cab_bytes = bytearray(10_000_064)
-    cab_bytes[0:8] = b'MSCF\x00\x00\x00\x00'
-    struct.pack_into('<I', cab_bytes, 8, 10_000_032)
-    cab_bytes[24] = 3
-    cab_bytes[25] = 1
-    installer.write_bytes(b'MZ' + b'\x00' * 126 + bytes(cab_bytes))
-    target_dir = tmp_path / 'target'
-    cache_dir = tmp_path / 'cache'
-    cache_dir.mkdir()
-    result = invoke(tmp_path, f'''
-$script:MsiExecCalled = $false
-$FakeBin = Join-Path {ps_quote(tmp_path)} 'fake-sys/System32'
-New-Item -ItemType Directory -Force -Path $FakeBin | Out-Null
-Set-Content -LiteralPath (Join-Path $FakeBin 'expand.exe') -Value ''
-$env:SystemRoot = Join-Path {ps_quote(tmp_path)} 'fake-sys'
-Set-Alias -Name (Join-Path $FakeBin 'expand.exe') -Value Invoke-FakeExpand
-function Invoke-FakeExpand {{
-    param($Cab, $Flag, $WorkDir)
-    Set-Content -LiteralPath (Join-Path $WorkDir ($Flag -replace '^-F:', '')) -Value 'not-an-msi'
-    $global:LASTEXITCODE = 0
-}}
-function Invoke-SetupProcess {{
-    param($Executable, $Arguments, [switch]$Elevate, $LogPath)
-    $script:MsiExecCalled = $true
-}}
-try {{ Unpack-PythonInstaller -Installer {ps_quote(installer)} -Target {ps_quote(target_dir)} -Cache {ps_quote(cache_dir)}; throw 'Unexpected payload accepted' }}
-catch {{
-    if ($_.Exception.Message -eq 'Unexpected payload accepted') {{ throw }}
-    Write-Output $_.Exception.Message
-}}
-if ($script:MsiExecCalled) {{ throw 'msiexec ran for an unexpected payload' }}
-if (Test-Path -LiteralPath (Join-Path {ps_quote(cache_dir)} 'python-unpack')) {{ throw 'WorkDir not cleaned up' }}
-Write-Output 'rejected'
-''')
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert 'no longer matches the verified payload layout' in result.stdout
-    assert 'rejected' in result.stdout
-
 
 
 WINDOWS_FACTS = ("@{ IsWindows = $true; Is64BitOs = $true; Is64BitProcess = $true; Arm64 = $false; Build = 19045; Major = 10; "
@@ -426,3 +214,116 @@ catch {{ Write-Output $_.Exception.Message }}
     else:
         assert 'Download failed after 3 attempts: https://example.com/file.bin (the connection timed out)' in result.stdout
         assert not destination.exists()
+
+
+def fake_package(path, entries):
+    """A stand-in nupkg (ZIP) plus the size and base64 SHA-512 the setup script should expect."""
+    import base64
+    import hashlib
+    import zipfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, 'w') as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    data = path.read_bytes()
+    return len(data), base64.b64encode(hashlib.sha512(data).digest()).decode()
+
+
+def package_overrides(size, digest):
+    return f"$script:PythonPackageSize = {size}; $script:PythonPackageSha512 = '{digest}'\n"
+
+
+def test_prestaged_package_is_used_without_download(tmp_path):
+    app = tmp_path / 'app'
+    size, digest = fake_package(app / 'runtime/installers/python.3.13.16.nupkg', {'tools/python.exe': 'x'})
+    result = invoke(tmp_path, package_overrides(size, digest) + f"""
+function Get-Download {{ throw 'no network' }}
+Write-Output ("package=" + (Split-Path -Leaf (Get-PythonPackage -AppDir {ps_quote(app)})))
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'package=python.3.13.16.nupkg' in result.stdout
+
+
+def test_package_with_the_wrong_hash_is_refused_and_deleted(tmp_path):
+    app = tmp_path / 'app'
+    staged = app / 'runtime/installers/python.3.13.16.nupkg'
+    fake_package(staged, {'tools/python.exe': 'tampered'})
+    result = invoke(tmp_path, f"""
+function Get-Download {{ param($Url, $Destination) Set-Content -LiteralPath $Destination -Value 'tampered download' }}
+try {{ Get-PythonPackage -AppDir {ps_quote(app)}; throw 'accepted' }} catch {{ Write-Output $_.Exception.Message }}
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'does not match the published SHA-512' in result.stdout  # the pre-staged file
+    assert 'does not match the published size and SHA-512; nothing was installed' in result.stdout
+    assert not staged.exists()
+
+
+def test_package_paths_outside_the_folder_are_refused(tmp_path):
+    package = tmp_path / 'evil.nupkg'
+    fake_package(package, {'tools/python.exe': 'x', 'tools/../../escaped.txt': 'boom'})
+    result = invoke(tmp_path, f"""
+try {{ Expand-PythonPackage -Package {ps_quote(package)} -Destination {ps_quote(tmp_path / 'target')}; throw 'extracted' }}
+catch {{ Write-Output $_.Exception.Message }}
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'contains an unsafe path' in result.stdout
+    assert not (tmp_path / 'escaped.txt').exists()
+
+
+def test_runtime_is_staged_marked_and_swapped_then_reused_offline(tmp_path):
+    app = tmp_path / 'app'
+    old = app / 'runtime/python'
+    old.mkdir(parents=True)
+    (old / 'python.exe').write_text('old msi extraction')  # unmarked runtime from an earlier version
+    size, digest = fake_package(app / 'runtime/installers/python.3.13.16.nupkg',
+                                {'tools/python.exe': 'new', 'tools/Lib/os.py': '#', '[Content_Types].xml': '<x/>'})
+    result = invoke(tmp_path, package_overrides(size, digest) + f"""
+function Test-RuntimePython {{ param($Python) return ((Test-Path -LiteralPath $Python) -and ((Get-Content -LiteralPath $Python -Raw) -match 'new')) }}
+$First = Initialize-RuntimePython -AppDir {ps_quote(app)}
+function Get-PythonPackage {{ throw 'network used on the second run' }}
+$Second = Initialize-RuntimePython -AppDir {ps_quote(app)}
+Write-Output ("same=" + ($First -eq $Second))
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'same=True' in result.stdout
+    assert (app / 'runtime/python/python.exe').read_text() == 'new'
+    assert (app / 'runtime/python/Lib/os.py').exists() and not (app / 'runtime/python/[Content_Types].xml').exists()
+    assert json.loads((app / 'runtime/python/.lcsjit-runtime.json').read_text())['version'] == '3.13.16'
+    kept = list((app / 'runtime').glob('python.old-*'))
+    assert len(kept) == 1 and (kept[0] / 'python.exe').read_text() == 'old msi extraction'
+    assert not list((app / 'runtime').glob('python.new-*'))
+
+
+@pytest.mark.parametrize(('home', 'version', 'rebuilt'), [
+    ('RUNTIME', '3.13.16', False),
+    ('C:/Users/old/AppData/Local/Programs/Python/Python311', '3.11.9', True),  # system Python on the first machine
+    ('MOVED', '3.13.16', True),  # the project folder was moved or copied
+])
+def test_venv_is_rebuilt_only_for_another_runtime_or_folder(tmp_path, home, version, rebuilt):
+    app = tmp_path / 'app'
+    runtime = app / 'runtime/python'
+    runtime.mkdir(parents=True)
+    venv_python = app / '.venv/Scripts/python.exe'
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text('venv python')
+    home_path = {'RUNTIME': str(runtime), 'MOVED': str(tmp_path / 'old-location/automation/runtime/python')}.get(home, home)
+    (app / '.venv/pyvenv.cfg').write_text(f'home = {home_path}\ninclude-system-site-packages = false\nversion = {version}\n')
+    result = invoke(tmp_path, f"""
+function Invoke-Native {{ param($FilePath, $Arguments, [switch]$Quiet) return [pscustomobject]@{{ ExitCode = 0; Started = $true; Tail = @(); Output = '' }} }}
+function Invoke-PythonStep {{
+    param($Python, $Arguments, $Failure)
+    $Venv = $Arguments[-1]
+    New-Item -ItemType Directory -Force -Path (Join-Path $Venv 'Scripts') | Out-Null
+    Set-Content -LiteralPath (Join-Path $Venv 'Scripts/python.exe') -Value 'rebuilt'
+    Set-Content -LiteralPath (Join-Path $Venv 'pyvenv.cfg') -Value ("home = {runtime}`nversion = 3.13.16")
+}}
+$Py = Initialize-Venv -AppDir {ps_quote(app)} -RuntimePython {ps_quote(runtime / 'python.exe')}
+Write-Output ("python=" + (Get-Content -LiteralPath $Py -Raw).Trim())
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    backups = list(app.glob('.venv.backup-*'))
+    if rebuilt:
+        assert 'python=rebuilt' in result.stdout and len(backups) == 1
+        assert (backups[0] / 'Scripts/python.exe').read_text() == 'venv python'
+    else:
+        assert 'python=venv python' in result.stdout and backups == []
