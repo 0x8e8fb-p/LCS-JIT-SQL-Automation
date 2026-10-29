@@ -18,7 +18,12 @@ from urllib.request import urlopen
 from cryptography.fernet import Fernet, InvalidToken
 from playwright.sync_api import Browser, BrowserContext, Locator, Page, Playwright, Error as BrowserError
 
-from automation_support import AutomationError, Config, Credentials, LCS_HOSTS, default_rule_name, describe_error, parse_expiry, parse_server_database, timestamp, utcnow
+from automation_support import (AutomationError, Config, Credentials, LCS_HOSTS, date_shape, default_rule_name, describe_error, parse_expiry,
+                                parse_lcs_datetime, parse_server_database, timestamp, utcnow)
+
+BROWSER_CHANNEL = 'chromium'  # Full Chromium for headless and visible runs (no headless shell).
+BROWSER_LOCALE = 'en-US'
+BROWSER_LAUNCH_TIMEOUT_MS = 120000  # First start can be slow while security software scans.
 
 LCS_URL = 'https://lcs.dynamics.com'
 LOGIN_HOSTS = {'login.microsoftonline.com', 'login.live.com', 'login.windows.net'}
@@ -111,17 +116,25 @@ class LCSAutomation:
         self.config = config
         self.log_dir = log_dir
         self.browser: Browser | None = None
+        self.lcs_date_format = ''
+        self.date_order_hint = ''
         headless = not (bootstrap or headed)
         profile_dir = self._profile_dir()
         try:
             state = None if bootstrap else self._initial_state(profile_dir)
+            # One binary for every mode: the full Chromium (channel 'chromium') runs
+            # headless and visible runs alike. en-US + UTC make LCS render the
+            # English labels and US dates the adapter was calibrated against.
             if profile_dir is not None:
                 profile_dir.mkdir(parents=True, exist_ok=True)
                 self.context = playwright.chromium.launch_persistent_context(
                     user_data_dir=str(profile_dir),
+                    channel=BROWSER_CHANNEL,
                     headless=headless,
                     accept_downloads=False,
                     timezone_id=config.browser_timezone,
+                    locale=BROWSER_LOCALE,
+                    timeout=BROWSER_LAUNCH_TIMEOUT_MS,
                 )
                 if state is not None and state.get('cookies'):
                     try:
@@ -130,8 +143,9 @@ class LCSAutomation:
                         pass
                 self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
             else:
-                self.browser = playwright.chromium.launch(headless=headless)
-                self.context = self.browser.new_context(storage_state=state, accept_downloads=False, timezone_id=config.browser_timezone)
+                self.browser = playwright.chromium.launch(channel=BROWSER_CHANNEL, headless=headless, timeout=BROWSER_LAUNCH_TIMEOUT_MS)
+                self.context = self.browser.new_context(storage_state=state, accept_downloads=False,
+                                                        timezone_id=config.browser_timezone, locale=BROWSER_LOCALE)
                 self.page = self.context.new_page()
             self.context.set_default_timeout(10000)
         except AutomationError:
@@ -444,19 +458,30 @@ class LCSAutomation:
         self.page.wait_for_timeout(2000)
         return dialog
 
-    def expiry_value(self, text: str) -> datetime:
+    def expiry_value(self, text: str, step: str | None = None, now: datetime | None = None) -> datetime:
+        """UTC expiry from an LCS cell; fails closed instead of guessing validity."""
+        step = step or str(getattr(self, 'step', 'jit_request'))
         if self.config.selectors.get('expiry_format') == 'lcs_utc':
             try:
-                # Browser context is explicitly UTC; the observed UI uses this format.
-                for pattern in ('%m/%d/%Y %I:%M %p', '%m/%d/%Y %I:%M:%S %p'):
-                    try:
-                        return datetime.strptime(text.strip(), pattern).replace(tzinfo=timezone.utc)
-                    except ValueError:
-                        continue
-                raise ValueError('unsupported display format')
+                parsed = parse_lcs_datetime(text, now or utcnow(), getattr(self, 'date_order_hint', ''))
             except ValueError:
-                raise AutomationError('jit_request', 'LCS expiry format changed; refusing to guess credential validity.') from None
-        return parse_expiry(text)
+                raise AutomationError(step, f'LCS showed an ambiguous expiry date ({date_shape(text)}) that cannot be read safely. '
+                                      'Set the LCS language to English (United States) in your LCS user settings and rerun; '
+                                      'the run refuses to guess credential or firewall validity.') from None
+            if parsed is None:
+                raise AutomationError(step, f'LCS showed an expiry date in an unrecognized format ({date_shape(text)}). '
+                                      'Set the LCS language to English (United States) in your LCS user settings and rerun; '
+                                      'the run refuses to guess credential or firewall validity.')
+            moment, style, ambiguous = parsed
+            if not getattr(self, 'lcs_date_format', ''):
+                self.lcs_date_format = style  # Reported as lcs_date_format in report.json.
+            if not ambiguous:
+                self.date_order_hint = style  # Resolves later ambiguous dates on the same page.
+            return moment
+        try:
+            return parse_expiry(text)
+        except AutomationError as error:
+            raise AutomationError(step, error.message) from None
 
     def reveal_password(self, row: Locator) -> None:
         if not self.config.selectors.get('password_reveal'):
@@ -468,15 +493,16 @@ class LCSAutomation:
     def rule_rows(self, dialog: Locator) -> Locator:
         return self.locator('rule_grid', scope=dialog).locator('.rowTemplate:not(.place-holder)')
 
-    def matching_owned_rows(self, dialog: Locator) -> list[Locator]:
+    def matching_owned_rows(self, dialog: Locator, step: str | None = None) -> list[Locator]:
+        step = step or str(getattr(self, 'step', 'cleanup'))
         matches = []
         for row in self.rule_rows(dialog).all():
             if row.locator("input[name='NetworkSecurityRuleName']").input_value() == self.rule_name:
                 if row.locator("input[name='NetworkSecurityRuleIpOrCidr']").input_value() not in {self.public_ip, self.public_ip + '/32'} or row.locator("input[name='NetworkSecurityGroupService']").input_value() != 'AzureSQL':
-                    raise AutomationError('cleanup', 'Owned-rule identity does not match source IP/service; refusing to remove it.')
+                    raise AutomationError(step, f'Firewall rule {self.rule_name} does not match this run\'s source IP/service; refusing to change or remove it.')
                 matches.append(row)
         if len(matches) > 1:
-            raise AutomationError('cleanup', 'Owned-rule name is ambiguous; refusing deletion.')
+            raise AutomationError(step, f'More than one firewall rule is named {self.rule_name}; refusing to change or remove any of them.')
         return matches
 
     def enable_rule_grid(self, public_ip: str) -> None:
@@ -485,7 +511,7 @@ class LCSAutomation:
             source = row.locator("input[name='NetworkSecurityRuleIpOrCidr']").input_value()
             service = row.locator("input[name='NetworkSecurityGroupService']").input_value()
             if source in {public_ip, public_ip + '/32'} and service == 'AzureSQL':
-                expiry = self.expiry_value(row.locator("input[name='NetworkSecurityGroupRuleExpiration']").input_value())
+                expiry = self.expiry_value(row.locator("input[name='NetworkSecurityGroupRuleExpiration']").input_value(), 'ip_rule')
                 if expiry <= utcnow():
                     continue # An expired entry provides no access and must not be reused.
                 self.firewall_expires_at = min(self.firewall_expires_at, expiry)
@@ -519,10 +545,10 @@ class LCSAutomation:
         self.refresh_environment()
         dialog = self.open_rule_grid()
         for _ in range(30):
-            matches = self.matching_owned_rows(dialog)
+            matches = self.matching_owned_rows(dialog, 'ip_rule')
             if matches:
                 self.rule_created = True
-                expiry = self.expiry_value(matches[0].locator("input[name='NetworkSecurityGroupRuleExpiration']").input_value())
+                expiry = self.expiry_value(matches[0].locator("input[name='NetworkSecurityGroupRuleExpiration']").input_value(), 'ip_rule')
                 self.firewall_expires_at = min(self.firewall_expires_at, expiry)
                 self.close_dialog(dialog)
                 self.screenshot('02_ip_rule')
@@ -537,7 +563,7 @@ class LCSAutomation:
         # This also recovers cleanup after a failed add-dialog transition.
         self.refresh_environment()
         dialog = self.open_rule_grid()
-        matches = self.matching_owned_rows(dialog)
+        matches = self.matching_owned_rows(dialog, 'cleanup')
         if not matches:
             self.close_dialog(dialog)
             # A fresh grid has confirmed absence (including natural expiry).
@@ -562,7 +588,7 @@ class LCSAutomation:
         # Verify server state after a full refresh, not a stale in-place grid.
         self.refresh_environment()
         fresh = self.open_rule_grid()
-        if self.matching_owned_rows(fresh):
+        if self.matching_owned_rows(fresh, 'cleanup'):
             raise AutomationError('cleanup', 'Owned rule still present in freshly opened grid; deletion not confirmed.')
         self.close_dialog(fresh)
         self.rule_created = False
@@ -595,7 +621,7 @@ class LCSAutomation:
                 continue
             if not password or set(password) <= {'*', '•', '●'}:
                 continue
-            expiry = self.expiry_value(expiry_text)
+            expiry = self.expiry_value(expiry_text, 'jit_request')
             server, database = parse_server_database(server_db, self.config.sql_dns_suffix)
             effective_expiry = min(expiry, self.firewall_expires_at, requested_at + timedelta(hours=8))
             if effective_expiry > utcnow() and username:

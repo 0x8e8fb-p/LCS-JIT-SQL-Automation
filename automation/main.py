@@ -138,6 +138,9 @@ def run(config: Config, log_dir: Path, *, headed: bool = False, interactive_auth
                         output.update(status='failure', failed_at_step='cleanup', error_message=output['cleanup']['error_message'], exit_code=1,
                                       screenshot_path=adapter.screenshot('error_cleanup'))
                 finally:
+                    date_format = getattr(adapter, 'lcs_date_format', '')
+                    if isinstance(date_format, str) and date_format:
+                        output['lcs_date_format'] = date_format  # How LCS rendered expiry dates on this machine.
                     try:
                         adapter.close()
                     except Exception:

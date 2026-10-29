@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from collections.abc import Iterator
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -211,6 +211,81 @@ def parse_expiry(value: str) -> datetime:
         return expiry.astimezone(timezone.utc)
     except ValueError:
         raise AutomationError('jit_request', 'Expiry must be ISO-8601 with an explicit timezone; calibrate expires_at selector.') from None
+
+
+# --- LCS display dates (browser context is UTC) ------------------------------
+# The verified LCS format is US 12-hour (10/7/2026 4:12 PM). Other regional
+# renderings are accepted so a machine's regional format cannot break a run, but
+# an ambiguous day/month is never guessed into a usable credential.
+EXPIRY_HORIZON = timedelta(hours=36)  # LCS rules and credentials last 8 hours.
+
+
+def _lcs_formats() -> list[tuple[str, str]]:
+    formats = [('us_12h', '%m/%d/%Y %I:%M %p'), ('us_12h', '%m/%d/%Y %I:%M:%S %p')]
+    for separator in ('/', '-', '.'):
+        for seconds in ('', ':%S'):
+            for style, pattern in (('month_first_12h', f'%m{separator}%d{separator}%Y %I:%M{seconds} %p'),
+                                   ('day_first_12h', f'%d{separator}%m{separator}%Y %I:%M{seconds} %p'),
+                                   ('month_first_24h', f'%m{separator}%d{separator}%Y %H:%M{seconds}'),
+                                   ('day_first_24h', f'%d{separator}%m{separator}%Y %H:%M{seconds}'),
+                                   ('year_first_24h', f'%Y{separator}%m{separator}%d %H:%M{seconds}'),
+                                   ('year_first_12h', f'%Y{separator}%m{separator}%d %I:%M{seconds} %p')):
+                if (style, pattern) not in formats:
+                    formats.append((style, pattern))
+    return formats
+
+
+LCS_FORMATS = _lcs_formats()
+
+
+def date_shape(text: str) -> str:
+    """Digits and letters masked: enough to recognize a format, nothing more."""
+    return re.sub(r'[A-Za-z]', 'a', re.sub(r'\d', '9', text))[:40]
+
+
+def normalize_display_date(text: str) -> str:
+    value = re.sub(r'[\u00a0\u2007\u2009\u202f\s]+', ' ', text).strip()
+    value = re.sub(r'\b([ap])\.\s?m\.?', lambda match: match.group(1).upper() + 'M', value, flags=re.IGNORECASE)
+    value = re.sub(r'(\d)\s*,\s*(\d)', r'\1 \2', value)  # "7/10/2026, 4:12 PM"
+    value = value.replace('T', ' ') if re.fullmatch(r'\d{4}-\d{2}-\d{2}T[\d:]+', value) else value
+    return value
+
+
+def parse_lcs_datetime(text: str, now: datetime, preferred: str = '') -> tuple[datetime, str, bool] | None:
+    """(UTC datetime, style, ambiguous) for an LCS display date; None if no format matches.
+
+    Several readings (day/month order) are narrowed to those no later than
+    now + 36 h; a known page style breaks ties, otherwise the latest remaining
+    reading wins. Raises ValueError if every reading is implausibly far ahead.
+    """
+    value = normalize_display_date(text)
+    candidates: dict[datetime, str] = {}
+    for style, pattern in LCS_FORMATS:
+        try:
+            parsed = datetime.strptime(value, pattern).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        candidates.setdefault(parsed, style)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        moment, style = next(iter(candidates.items()))
+        return moment, style, False
+    plausible = {moment: style for moment, style in candidates.items() if moment <= now + EXPIRY_HORIZON}
+    if not plausible:
+        raise ValueError('ambiguous date with no plausible reading')
+    if preferred:
+        same_order = [moment for moment, style in plausible.items() if date_order(style) == date_order(preferred)]
+        if len(same_order) == 1:
+            return same_order[0], plausible[same_order[0]], True
+    latest = max(plausible)
+    return latest, plausible[latest], True
+
+
+def date_order(style: str) -> str:
+    if style == 'us_12h' or style.startswith('month_first'):
+        return 'month_first'
+    return 'day_first' if style.startswith('day_first') else 'year_first'
 
 
 @dataclass(repr=False)
