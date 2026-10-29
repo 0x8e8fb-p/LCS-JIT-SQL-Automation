@@ -138,6 +138,9 @@ def run(config: Config, log_dir: Path, *, headed: bool = False, interactive_auth
                         output.update(status='failure', failed_at_step='cleanup', error_message=output['cleanup']['error_message'], exit_code=1,
                                       screenshot_path=adapter.screenshot('error_cleanup'))
                 finally:
+                    warnings = getattr(adapter, 'warnings', None)
+                    if isinstance(warnings, list) and warnings:
+                        output['warnings'] = list(warnings)
                     date_format = getattr(adapter, 'lcs_date_format', '')
                     if isinstance(date_format, str) and date_format:
                         output['lcs_date_format'] = date_format  # How LCS rendered expiry dates on this machine.
@@ -212,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
                 finally:
                     adapter.close()
             output = {'status': 'success', 'authentication_state': 'valid', 'access_changes': False}
+            if adapter.warnings:
+                output['warnings'] = adapter.warnings
         elif args.command == 'import-auth':
             from urllib.parse import urlsplit
             target = urlsplit(args.cdp_url)
@@ -231,9 +236,9 @@ def main(argv: list[str] | None = None) -> int:
                 heading = matches[0][1].locator('h1')
                 if heading.count() != 1 or not heading.inner_text().strip() or (config.environment_id and heading.inner_text().strip() != config.environment_id):
                     raise AutomationError('environment', 'Inspection browser environment heading does not match the configured environment.')
-                save_auth(matches[0][0], config.state_path, config.auth_key_path)
+                rotated = save_auth(matches[0][0], config.state_path, config.auth_key_path)
                 # Do not close the user's inspection browser; exiting Playwright disconnects.
-            output = {'status': 'success', 'authentication_state': 'imported_encrypted'}
+            output = {'status': 'success', 'authentication_state': 'imported_encrypted', 'auth_reset': rotated}
         elif args.command == 'bootstrap':
             with sync_playwright() as playwright:
                 adapter = LCSAutomation(config, playwright, config.logs_path, bootstrap=True)
@@ -241,7 +246,9 @@ def main(argv: list[str] | None = None) -> int:
                     adapter.bootstrap()
                 finally:
                     adapter.close()
-            output = {'status': 'success', 'authentication_state': 'saved_encrypted'}
+            output = {'status': 'success', 'authentication_state': 'saved_encrypted', 'auth_reset': adapter.auth_reset}
+            if adapter.auth_reset:
+                output['note'] = 'The previous sign-in files could not be read by this Windows user and were kept as *.stale-<UTC> in automation/.auth.'
         else:
             scripts = prepare_scripts(config.scripts_path) # Freeze exact batches before access changes.
             check_runtime(config)

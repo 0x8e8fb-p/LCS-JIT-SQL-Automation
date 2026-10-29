@@ -41,31 +41,128 @@ def collapse(value: str) -> str:
     return ' '.join(value.split())
 
 
+CRYPTPROTECT_UI_FORBIDDEN = 0x1
+NO_SIGN_IN = 'No saved sign-in on this computer yet. Run .\\run.cmd and complete sign-in when asked (or .\\run.cmd -LaunchOnly to sign in only).'
+SIGN_IN_AGAIN = 'Sign in again: run .\\run.cmd and complete sign-in when asked.'
+
+
+class DpapiError(Exception):
+    """Windows DPAPI failure with its Win32 error code (0 when DPAPI is unavailable)."""
+    def __init__(self, code: int):
+        super().__init__(code)
+        self.code = code
+
+
+class UnreadableKey(Exception):
+    """The saved key exists but this Windows user cannot decrypt it (other user/computer, damaged)."""
+    def __init__(self, code: int):
+        super().__init__(code)
+        self.code = code
+
+
+def _dpapi_available() -> bool:
+    return os.name == 'nt'
+
+
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    """CryptProtectData/CryptUnprotectData for the current Windows user."""
+    if sys.platform != 'win32':
+        raise DpapiError(0)
+    from ctypes import wintypes
+
+    class DataBlob(ctypes.Structure):
+        _fields_ = [('cbData', wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.WinDLL('crypt32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    function = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    function.argtypes = [ctypes.POINTER(DataBlob), ctypes.c_void_p, ctypes.POINTER(DataBlob), ctypes.c_void_p,
+                         ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DataBlob)]
+    function.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    buffer = ctypes.create_string_buffer(data, len(data))
+    source = DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+    target = DataBlob()
+    if not function(ctypes.byref(source), None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(target)):
+        raise DpapiError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(target.pbData, target.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(target.pbData, ctypes.c_void_p))
+
+
+def _error_code(error: OSError) -> object:
+    return getattr(error, 'winerror', None) or error.errno or 'unknown'
+
+
+def write_atomic(path: Path, data: bytes, what: str) -> None:
+    """Write via a unique temporary file and an atomic replace.
+
+    Antivirus, backup or OneDrive can hold the target briefly, so the replace is
+    retried. A failure never leaves a partial or empty file behind.
+    """
+    temporary = path.with_name(f'{path.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Exclusive open never follows an existing temporary file or symlink.
+        with temporary.open('xb') as handle:
+            handle.write(data)
+        os.chmod(temporary, 0o600)
+        delay = 0.2
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+    except OSError as error:
+        raise AutomationError('auth_state_write', f'Cannot save the {what} (error {_error_code(error)}). Antivirus, backup software or OneDrive '
+                              'may be locking automation/.auth; exclude that folder or move the project out of OneDrive, then retry.') from None
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass  # Never hide the primary result; a leftover *.tmp holds only ciphertext.
+
+
+def _create_key(path: Path) -> bytes:
+    key = Fernet.generate_key()
+    try:
+        blob = _dpapi(key, True)  # Protect first: nothing is written if DPAPI fails.
+    except DpapiError as error:
+        raise AutomationError('auth_state_write', f'Windows could not protect the sign-in key (DPAPI error {error.code}). Sign in from a normal '
+                              'interactive Windows session; for Task Scheduler use "Run whether user is logged on or not" with the password stored.') from None
+    write_atomic(path, blob, 'sign-in key')
+    return key
+
+
 def protected_local_key(path: Path, *, create: bool = False) -> bytes:
     """Windows DPAPI binds a Fernet key to the current Windows identity."""
-    if os.name != 'nt':
+    if not _dpapi_available():
         raise AutomationError('authentication', 'AUTH_KEY_PATH requires Windows DPAPI; otherwise inject LCS_AUTH_KEY.')
-    class Blob(ctypes.Structure):
-        _fields_ = [('size', ctypes.c_ulong), ('data', ctypes.POINTER(ctypes.c_ubyte))]
-    def transform(data: bytes, protect: bool) -> bytes:
-        buffer = ctypes.create_string_buffer(data)
-        source = Blob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
-        target = Blob()
-        function = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
-        if not function(ctypes.byref(source), None, None, None, None, 1, ctypes.byref(target)):
-            raise AutomationError('authentication', 'Windows DPAPI could not protect/unprotect the local auth key.')
-        try:
-            return ctypes.string_at(target.data, target.size)
-        finally:
-            ctypes.windll.kernel32.LocalFree(target.data)
+    if not path.exists():
+        if not create:
+            raise AutomationError('authentication', NO_SIGN_IN)
+        return _create_key(path)
     try:
-        if not path.exists() and create:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open('xb') as handle:
-                handle.write(transform(Fernet.generate_key(), True))
-        return transform(path.read_bytes(), False)
-    except OSError:
-        raise AutomationError('authentication', 'DPAPI key unavailable; bootstrap with the same Windows task identity.') from None
+        blob = path.read_bytes()
+    except OSError as error:
+        raise AutomationError('authentication', f'The saved sign-in key cannot be read (error {_error_code(error)}). Check permissions on automation/.auth '
+                              'and that antivirus or OneDrive is not locking it.') from None
+    try:
+        key = _dpapi(blob, False) if blob else b''
+        Fernet(key)
+        return key
+    except (DpapiError, ValueError) as error:
+        code = error.code if isinstance(error, DpapiError) else 13  # 13: ERROR_INVALID_DATA (empty or damaged)
+        if create:
+            raise UnreadableKey(code) from None
+        raise AutomationError('authentication', f'The saved sign-in on this computer belongs to a different Windows user or computer, or it is damaged '
+                              f'(DPAPI error {code}). {SIGN_IN_AGAIN}') from None
 
 
 def cipher(key_path: Path | None = None, *, create: bool = False) -> Fernet:
@@ -77,36 +174,59 @@ def cipher(key_path: Path | None = None, *, create: bool = False) -> Fernet:
             return Fernet(protected_local_key(key_path, create=create))
         raise KeyError('LCS_AUTH_KEY')
     except (KeyError, ValueError, UnicodeError):
-        raise AutomationError('authentication', 'Set LCS_AUTH_KEY to a Fernet key from your local secret manager (see README).') from None
+        raise AutomationError('authentication', 'Set LCS_AUTH_KEY to a valid Fernet key from your secret manager, or remove it to use the '
+                              'Windows-protected key (README.md#security-and-cleanup).') from None
 
 
-def save_auth(context: BrowserContext, path: Path, key_path: Path | None = None) -> None:
-    encrypted = cipher(key_path, create=True).encrypt(json.dumps(context.storage_state(indexed_db=True)).encode('utf-8'))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+def save_auth(context: BrowserContext, path: Path, key_path: Path | None = None) -> bool:
+    """Encrypt and save the browser state. True when an unreadable key was replaced."""
+    rotated = False
     try:
-        # Ciphertext only; exclusive open prevents following an existing temporary symlink.
-        with temporary.open('xb') as handle:
-            os.chmod(temporary, 0o600)
-            handle.write(encrypted)
-        temporary.replace(path)
-    except OSError:
-        raise AutomationError('authentication', 'Cannot save encrypted auth state. Check path permissions and disk space.') from None
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            raise AutomationError('authentication', 'Cannot remove temporary encrypted auth file. Check directory permissions.') from None
+        fernet = cipher(key_path, create=True)
+    except UnreadableKey:
+        # A key from another Windows user/computer (or a damaged one) can never be
+        # decrypted here. Keep it and the old state for inspection, then start over.
+        stamp = utcnow().strftime('%Y%m%dT%H%M%SZ')
+        for item in (key_path, path):
+            if item is not None and item.exists():
+                try:
+                    item.replace(item.with_name(f'{item.name}.stale-{stamp}'))
+                except OSError as error:
+                    raise AutomationError('auth_state_write', f'Cannot set aside the unreadable sign-in file {item.name} (error {_error_code(error)}). '
+                                          'Close other runs and check permissions on automation/.auth.') from None
+        fernet = cipher(key_path, create=True)
+        rotated = True
+    encrypted = fernet.encrypt(json.dumps(context.storage_state(indexed_db=True)).encode('utf-8'))
+    write_atomic(path, encrypted, 'encrypted sign-in state')
+    return rotated
 
 
 def load_auth(path: Path, key_path: Path | None = None) -> StorageState:
+    if not path.exists():
+        raise AutomationError('authentication', NO_SIGN_IN)
+    fernet = cipher(key_path)
     try:
-        state = json.loads(cipher(key_path).decrypt(path.read_bytes()))
+        state = json.loads(fernet.decrypt(path.read_bytes()))
         if not isinstance(state, dict) or 'cookies' not in state or 'origins' not in state:
             raise ValueError('invalid state')
         return cast(StorageState, state)
-    except (OSError, InvalidToken, ValueError):
-        raise AutomationError('authentication', 'Encrypted authentication state is missing or invalid. Run ./run.ps1 -ForceInteractive with the same Windows identity/auth key.') from None
+    except InvalidToken:
+        raise AutomationError('authentication', 'The saved sign-in could not be decrypted (it was saved by another Windows user, computer or LCS_AUTH_KEY). '
+                              f'{SIGN_IN_AGAIN}') from None
+    except (OSError, ValueError):
+        raise AutomationError('authentication', f'The saved sign-in file is unreadable or damaged. {SIGN_IN_AGAIN}') from None
+
+
+def wait_for_enter(prompt: str) -> None:
+    """The interactive sign-in pause; refuses consoles that cannot answer."""
+    print(prompt, file=sys.stderr)
+    try:
+        if sys.stdin is None:
+            raise EOFError
+        input()
+    except (EOFError, RuntimeError, OSError):
+        raise AutomationError('authentication', 'Sign-in needs an interactive console. Run run.cmd from PowerShell or Windows Terminal once; '
+                              '-Headless runs reuse that login.') from None
 
 
 def get_public_ip(config: Config) -> str:
@@ -147,6 +267,8 @@ class LCSAutomation:
         self.log_dir = log_dir
         self.browser: Browser | None = None
         self.lcs_date_format = ''
+        self.warnings: list[str] = []
+        self.auth_reset = False
         self.date_order_hint = ''
         headless = not (bootstrap or headed)
         profile_dir = self._profile_dir()
@@ -170,7 +292,8 @@ class LCSAutomation:
                     try:
                         self.context.add_cookies(cast(Sequence[SetCookieParam], state['cookies']))
                     except Exception:
-                        pass
+                        # The browser profile still holds its own cookies; sign-in is checked next.
+                        self.warnings.append('Some saved sign-in cookies could not be restored; if LCS asks you to sign in, do so once.')
                 self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
             else:
                 self.browser = playwright.chromium.launch(channel=BROWSER_CHANNEL, headless=headless, timeout=BROWSER_LAUNCH_TIMEOUT_MS)
@@ -321,7 +444,7 @@ class LCSAutomation:
         expected = urlsplit(self.config.environment_url) if self.config.environment_url else None
         expected_host = expected.netloc if expected is not None else urlsplit(self.config.lcs_origin).netloc
         if target.scheme != 'https' or target.netloc != expected_host:
-            raise AutomationError('authentication', 'Authentication expired or sign-in/MFA requires interaction. Run ./run.ps1 -ForceInteractive.')
+            raise AutomationError('authentication', 'Authentication expired or sign-in/MFA requires interaction. Run .\\run.cmd -ForceInteractive.')
         if expected is not None:
             if target.path != expected.path or [v.lower() for v in parse_qs(target.query).get('EnvironmentId', [])] != [v.lower() for v in parse_qs(expected.query).get('EnvironmentId', [])]:
                 raise AutomationError('environment', 'Environment URL does not match the configured project/environment; refusing access changes.')
@@ -335,6 +458,15 @@ class LCSAutomation:
             raise AutomationError('environment', 'Environment heading does not match ENVIRONMENT_ID; refusing access changes.')
         if not self.config.environment_id:
             self.config.environment_id = name # Discovered only after URL/project/GUID verification.
+
+    def refresh_saved_auth(self) -> None:
+        """Keep the saved sign-in current; a locked file must not fail a working session."""
+        try:
+            self.auth_reset = save_auth(self.context, self.config.state_path, self.config.auth_key_path) or self.auth_reset
+        except AutomationError as error:
+            if error.step != 'auth_state_write':
+                raise
+            self.warnings.append(error.message + ' The current run continues with the sign-in already open.')
 
     def _on_lcs(self) -> bool:
         from urllib.parse import urlsplit
@@ -424,13 +556,13 @@ class LCSAutomation:
                             continue  # One reload: the first LCS load after sign-in can be slow.
                         raise self._slow_section('The Database accounts section of the environment page')
                     self.verify_environment()
-                    save_auth(self.context, self.config.state_path, self.config.auth_key_path)
+                    self.refresh_saved_auth()
                     self.screenshot('01_login')
                     return
                 self.locator('environment_link').wait_for(state='visible', timeout=self.NAVIGATION_TIMEOUT_MS)
                 if not self.page.url.startswith(origin_url + '/'):
                     raise AutomationError('authentication', 'Authentication expired or MFA/Conditional Access requires interaction. Run .\\run.cmd -ForceInteractive on this computer.')
-                save_auth(self.context, self.config.state_path, self.config.auth_key_path)
+                self.refresh_saved_auth()
                 self.screenshot('01_login')
                 self.locator('environment_link').click()
                 self.locator('accounts').wait_for(state='visible', timeout=self.NAVIGATION_TIMEOUT_MS)
@@ -481,8 +613,7 @@ class LCSAutomation:
         if navigate_first:
             self.page.goto(target_url, wait_until='domcontentloaded', timeout=self.NAVIGATION_TIMEOUT_MS)
         if self.config.environment_url:
-            print('Complete sign-in and MFA; wait for the environment page to load, then press Enter here.', file=sys.stderr)
-            input()
+            wait_for_enter('Complete sign-in and MFA; wait for the environment page to load, then press Enter here.')
             self._complete_lcs_landing(target_url)
             if not self.page.url.startswith(origin_url + '/'):
                 problem = self._landing_problem()
@@ -504,14 +635,14 @@ class LCSAutomation:
             self.verify_environment()
             self.wait_idle()
         else:
-            print('Complete sign-in and MFA in the browser; open the project, then press Enter here.', file=sys.stderr)
-            input()
+            wait_for_enter('Complete sign-in and MFA in the browser; open the project, then press Enter here.')
             self._complete_lcs_landing(target_url)
             if not self.page.url.startswith(f'{origin_url}/V2/Project/{self.config.project_id}'):
                 raise AutomationError('authentication', 'Open the configured LCS project before saving authentication.')
             self.locator('environment_link').wait_for(state='visible', timeout=self.NAVIGATION_TIMEOUT_MS)
             self.wait_idle()
-        save_auth(self.context, self.config.state_path, self.config.auth_key_path)
+        # Bootstrap exists to save the sign-in, so a failed save is an error here.
+        self.auth_reset = save_auth(self.context, self.config.state_path, self.config.auth_key_path) or self.auth_reset
 
     def enable_ip(self, public_ip: str) -> None:
         self.step = 'ip_rule'
