@@ -1,0 +1,6 @@
+# Windows scripts must have CRLF line endings: cmd.exe misreads goto labels in
+# LF-only batch files, and GitHub ZIP downloads honor these rules.
+* text=auto
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

@@ -128,3 +128,89 @@ def test_batch_wrapper_from_another_directory(tmp_path):
                             cwd=tmp_path, capture_output=True, text=True, encoding='oem', errors='replace', timeout=60)
     assert result.returncode == 1
     assert 'Unknown argument' in result.stdout
+
+
+def test_check_auth_without_a_result_is_explained(tmp_path):
+    script, app = fake_launcher(tmp_path, '''import sys
+command = sys.argv[1]
+if command == 'check-auth':
+    print('not json: crashed early')
+    sys.exit(1)
+print('{"status": "success"}')
+''')
+    result = invoke(script)
+    assert result.returncode == 1
+    assert 'not json: crashed early' in result.stdout
+    assert 'check-auth returned no result (exit 1)' in result.stdout
+
+
+def test_check_auth_with_empty_output_is_explained(tmp_path):
+    script, app = fake_launcher(tmp_path, '''import sys
+if sys.argv[1] == 'check-auth':
+    sys.exit(3)
+print('{"status": "success"}')
+''')
+    result = invoke(script)
+    assert result.returncode == 1
+    assert 'check-auth returned no result (exit 3)' in result.stdout
+
+
+def test_sign_in_reason_is_shown_before_bootstrap(tmp_path, monkeypatch):
+    monkeypatch.delenv('TEST_FAIL_COMMAND', raising=False)
+    script, app = fake_launcher(tmp_path, '''import json, sys
+from pathlib import Path
+command = sys.argv[1]
+with Path(__file__).with_name('calls.txt').open('a') as f:
+    f.write(command + '\\n')
+if command == 'check-auth':
+    print(json.dumps({'status': 'failure', 'failed_at_step': 'authentication', 'error_message': 'No saved sign-in on this computer yet.'}))
+    sys.exit(1)
+print(json.dumps({'status': 'success'}))
+''')
+    result = invoke(script)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'Sign-in needed: No saved sign-in on this computer yet.' in result.stdout
+    assert (app / 'calls.txt').read_text().splitlines() == ['validate', 'check-auth', 'bootstrap', 'run']
+
+
+def test_held_lock_names_the_reason(tmp_path):
+    script, app = fake_launcher(tmp_path, 'print("{}")\n')
+    lock = app / '.launcher.lock'
+    with lock.open('a+b') as handle:
+        if os.name == 'nt':
+            import msvcrt
+            handle.write(b'0')
+            handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = invoke(script)
+    assert result.returncode == 1
+    assert 'Cannot take the launcher lock: ' in result.stdout
+    assert 'Close other runs of .\\run.cmd' in result.stdout
+
+
+def test_gitattributes_keep_windows_scripts_crlf():
+    rules = (ROOT / '.gitattributes').read_text(encoding='utf-8').splitlines()
+    for pattern in ('*.cmd', '*.bat', '*.ps1'):
+        assert f'{pattern} text eol=crlf' in rules
+    for launcher in (ROOT / 'run.cmd', ROOT / 'automation' / 'run.cmd'):
+        data = launcher.read_bytes()
+        assert data.count(b'\n') == data.count(b'\r\n'), f'{launcher.name} must use CRLF line endings'
+        assert b'-ExecutionPolicy Bypass' in data
+
+
+@pytest.mark.windows('runs cmd.exe')
+def test_root_run_cmd_forwards_arguments_and_exit_code(tmp_path):
+    folder = tmp_path / 'project & co'
+    folder.mkdir()
+    (folder / 'run.cmd').write_bytes((ROOT / 'run.cmd').read_bytes())
+    (folder / 'run.ps1').write_text('param([string]$Config, [switch]$ValidateOnly)\n'
+                                    '"config=$Config validate=$ValidateOnly policy=$(Get-ExecutionPolicy -Scope Process)" | Set-Content -LiteralPath (Join-Path $PSScriptRoot "args.txt")\n'
+                                    'exit 7\n', encoding='utf-8')
+    result = subprocess.run(['cmd.exe', '/d', '/c', str(folder / 'run.cmd'), '-ValidateOnly', '-Config', 'my profile & more.yaml'],
+                            cwd=tmp_path, capture_output=True, text=True, encoding='oem', errors='replace', timeout=120)
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert (folder / 'args.txt').read_text(encoding='utf-8-sig').strip() == 'config=my profile & more.yaml validate=True policy=Bypass'
