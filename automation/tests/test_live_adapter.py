@@ -170,6 +170,8 @@ def test_browser_grid_add_cleanup_with_stale_modal_layer(tmp_path, monkeypatch):
     config.state_path = tmp_path / 'auth.enc'
     config.auth_key_path = None
     monkeypatch.setenv('LCS_AUTH_KEY', Fernet.generate_key().decode())
+    from helpers import fast_lcs_timings
+    fast_lcs_timings(monkeypatch)
     config.state_path.write_bytes(lcs.cipher().encrypt(json.dumps({'cookies': [], 'origins': []}).encode()))
     state = {'rule': False, 'adds': 0, 'deletes': 0, 'reloads': 0}
     expiry = (utcnow() + timedelta(hours=7)).strftime('%m/%d/%Y %I:%M:%S %p')

@@ -18,6 +18,7 @@ import lcs_jit_automation as lcs
 import main
 import sql_executor as sql
 from automation_support import AutomationError, Config, Credentials, parse_expiry, parse_server_database, utcnow
+from helpers import fast_lcs_timings
 
 
 
@@ -183,6 +184,7 @@ def browser_fixture(config, monkeypatch):
     monkeypatch.setattr(sql.pyodbc, 'drivers', lambda: ['ODBC Driver 18 for SQL Server'])
     config.state_path.write_bytes(lcs.cipher().encrypt(json.dumps({'cookies': [], 'origins': []}).encode()))
     monkeypatch.setattr(lcs.time, 'sleep', lambda _: None)
+    fast_lcs_timings(monkeypatch)
     granted = {'value': False}
     expiry = (utcnow() + timedelta(hours=7)).isoformat()
     password = 'FIXTURE_PASSWORD_DO_NOT_LOG'

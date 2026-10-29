@@ -102,6 +102,18 @@ def run_setup_snippet(tmp_path: Path, body: str, timeout: float = 120) -> subpro
     return run_powershell(script, timeout=timeout, utf8_output=True)
 
 
+def fast_lcs_timings(monkeypatch: pytest.MonkeyPatch, **overrides: float) -> None:
+    """Shrink the adapter's waits for local browser fixtures (production limits are minutes)."""
+    import lcs_jit_automation as lcs
+    values: dict[str, float] = dict(GRID_SETTLE_POLL_MS=50, GRID_EMPTY_SETTLE_MS=600, GRID_SETTLE_TIMEOUT_MS=8000, CONFIRM_TIMEOUT_MS=500,
+                                    RULE_REFRESH_PAUSE_SECONDS=0.05, CREDENTIAL_FIRST_WAIT_SECONDS=0.05,
+                                    CREDENTIAL_POLL_INTERVAL_SECONDS=0.05, REVEAL_TIMEOUT_MS=500, SIGN_IN_GRACE_MS=1500)
+    values.update(overrides)
+    for name, value in values.items():
+        assert hasattr(lcs.LCSAutomation, name), name
+        monkeypatch.setattr(lcs.LCSAutomation, name, value)
+
+
 def make_config() -> MagicMock:
     config = MagicMock()
     config.disable_access_after = True
