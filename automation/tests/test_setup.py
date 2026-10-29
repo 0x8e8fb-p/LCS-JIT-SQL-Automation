@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import platform
 import sys
 
 import pytest
@@ -30,8 +29,6 @@ Write-Output 'probe-returned-false'
 
 
 @pytest.mark.parametrize('fresh', [True, False])
-@pytest.mark.windows('exercises the real Windows x64 platform guard')
-@pytest.mark.skipif(platform.machine().lower() not in {'amd64', 'x86_64'}, reason='x64 only: the setup guard refuses ARM64 by design')
 def test_setup_first_run_and_repeat_are_idempotent(tmp_path, fresh):
     app = tmp_path / 'app with spaces'
     app.mkdir()
@@ -45,6 +42,7 @@ $script:Driver = ${str(not fresh).lower()}
 $script:Browser = ${str(not fresh).lower()}
 $script:Calls = New-Object 'System.Collections.Generic.List[string]'
 $App = {ps_quote(app)}
+function Assert-SetupReady {{ param($AppDir) $script:Calls.Add('preflight') }}
 function Test-SupportedPython {{ param($Executable, $Prefix) return $script:Ready }}
 function Find-SupportedPython {{ param($AppDir) $script:Calls.Add('find'); return $null }}
 function Install-LocalPython {{ param($AppDir) $script:Calls.Add('python'); return 'fake-python' }}
@@ -70,15 +68,15 @@ $first = Initialize-Prerequisites -AppDir $App
 $second = Initialize-Prerequisites -AppDir $App
 if ($first -ne $second -or $first -notlike '*python.exe') {{ throw 'Incorrect Python return value' }}
 Write-Output ('calls=' + ($script:Calls -join ','))
-Write-Output ('backups=' + @(Get-ChildItem -LiteralPath $App -Directory -Filter '.venv.backup-*').Count)
+Write-Output ('backups=' + @(Get-ChildItem -LiteralPath $App -Directory -Force -Filter '.venv.backup-*').Count)
 '''
     result = invoke(tmp_path, body)
     assert result.returncode == 0, result.stdout + result.stderr
     if fresh:
-        assert 'calls=find,python,venv,pip-install,pip-check,odbc,chromium,pip-check' in result.stdout
+        assert 'calls=preflight,find,python,venv,pip-install,pip-check,odbc,chromium,preflight,pip-check' in result.stdout
         assert 'backups=1' in result.stdout
     else:
-        assert 'calls=pip-check,pip-check\n' in result.stdout
+        assert 'calls=preflight,pip-check,preflight,pip-check\n' in result.stdout
         assert 'backups=0' in result.stdout
 
 
@@ -337,3 +335,94 @@ Write-Output 'rejected'
     assert 'no longer matches the verified payload layout' in result.stdout
     assert 'rejected' in result.stdout
 
+
+
+WINDOWS_FACTS = ("@{ IsWindows = $true; Is64BitOs = $true; Is64BitProcess = $true; Arm64 = $false; Build = 19045; Major = 10; "
+                 "LanguageMode = 'FullLanguage'; HostName = 'ConsoleHost'; LongPathsEnabled = $false; DriveType = 'Fixed'; "
+                 "FreeBytes = [long]50GB; Writable = $true; OneDriveRoots = @(); ControlledFolderAccess = $false }")
+
+
+def test_preflight_lists_every_blocker_at_once(tmp_path):
+    result = invoke(tmp_path, f"""
+$Facts = {WINDOWS_FACTS}
+$Facts.Is64BitProcess = $false; $Facts.LanguageMode = 'ConstrainedLanguage'; $Facts.DriveType = 'Network'
+$Facts.Writable = $false; $Facts.FreeBytes = [long]200MB
+function Get-SetupPlatform {{ param($AppDir) return $Facts }}
+$App = 'Z:\\Projects\\copy [1]\\' + ('x' * 150) + '\\automation'
+try {{ Assert-SetupReady -AppDir $App; throw 'not stopped' }} catch {{ Write-Output $_.Exception.Message }}
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert out.startswith('Setup cannot continue on this computer:')
+    for phrase in ('32-bit PowerShell', 'ConstrainedLanguage mode', 'network drive', 'contains [ ] or a backtick',
+                   'not writable', 'GB is free', 'path is too long'):
+        assert phrase in out, phrase
+    assert out.count('\n  - ') == 7
+
+
+def test_preflight_warnings_do_not_stop_setup(tmp_path):
+    result = invoke(tmp_path, f"""
+$Facts = {WINDOWS_FACTS}
+$Facts.OneDriveRoots = @('C:\\Users\\pat\\OneDrive - Contoso'); $Facts.ControlledFolderAccess = $true
+function Get-SetupPlatform {{ param($AppDir) return $Facts }}
+Assert-SetupReady -AppDir 'C:\\Users\\pat\\OneDrive - Contoso\\LCS\\automation'
+Write-Output 'continued'
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'inside OneDrive' in result.stdout and 'Controlled Folder Access' in result.stdout
+    assert 'continued' in result.stdout
+
+
+def test_child_environment_removes_breaking_settings_and_keeps_user_choices(tmp_path):
+    result = invoke(tmp_path, f"""
+$env:PYTHONHOME = 'C:\\ArcGIS\\Python'; $env:PYTHONPATH = 'x'; $env:PIP_TARGET = 'y'; $env:NODE_OPTIONS = '--inspect'
+$env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'; $env:PIP_INDEX_URL = 'https://mirror.example/simple'; $env:HTTPS_PROXY = 'http://proxy.example:8080'
+$env:NODE_EXTRA_CA_CERTS = 'C:\\certs\\corp.pem'
+Set-ChildEnvironment -AppDir {ps_quote(tmp_path)}
+foreach ($Name in 'PYTHONHOME','PYTHONPATH','PIP_TARGET','NODE_OPTIONS','PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD') {{ if (Test-Path "Env:$Name") {{ throw "$Name kept" }} }}
+Write-Output ("user=" + $env:PIP_INDEX_URL + "|" + $env:HTTPS_PROXY + "|" + $env:NODE_EXTRA_CA_CERTS)
+Write-Output ("set=" + $env:PYTHONNOUSERSITE + $env:PIP_USER + "|" + $env:PLAYWRIGHT_BROWSERS_PATH)
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'user=https://mirror.example/simple|http://proxy.example:8080|C:\\certs\\corp.pem' in result.stdout
+    assert f'set=10|{tmp_path / "browsers"}' in result.stdout
+
+
+def test_invoke_native_reports_missing_programs_and_exit_codes(tmp_path):
+    result = invoke(tmp_path, f"""
+Start-SetupLog -AppDir {ps_quote(tmp_path)}
+$global:LASTEXITCODE = 0
+$Missing = Invoke-Native -FilePath {ps_quote(tmp_path / 'missing.exe')} -Quiet
+Write-Output ("missing=" + $Missing.ExitCode + "/" + $Missing.Started)
+$Failed = Invoke-Native -FilePath {ps_quote(sys.executable)} -Arguments @('-c', 'import sys; print(''probe-line''); sys.exit(3)') -Quiet
+Write-Output ("failed=" + $Failed.ExitCode + "/" + ($Failed.Tail -join ','))
+Write-Output ("log=" + (Get-Content -LiteralPath $script:SetupLog -Raw).Contains('probe-line'))
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'missing=-1/False' in result.stdout
+    assert 'failed=3/probe-line' in result.stdout
+    assert 'log=True' in result.stdout
+
+
+@pytest.mark.parametrize('failures', [2, 3])
+def test_downloads_retry_then_explain(tmp_path, failures):
+    destination = tmp_path / 'downloads' / 'file.bin'
+    result = invoke(tmp_path, f"""
+$script:Attempts = 0
+function Start-Sleep {{ param($Seconds) }}
+function Invoke-WebRequest {{
+    param([switch]$UseBasicParsing, $Uri, $OutFile, $TimeoutSec, $Proxy, [switch]$ProxyUseDefaultCredentials)
+    $script:Attempts++
+    if ($script:Attempts -le {failures}) {{ throw [System.Net.WebException]::new('The operation has timed out') }}
+    Set-Content -LiteralPath $OutFile -Value 'payload'
+}}
+try {{ $Path = Get-Download -Url 'https://example.com/file.bin' -Destination {ps_quote(destination)}; Write-Output "ok=$($script:Attempts)" }}
+catch {{ Write-Output $_.Exception.Message }}
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    if failures == 2:
+        assert 'ok=3' in result.stdout and destination.exists()
+        assert not destination.with_name('file.bin.partial').exists()
+    else:
+        assert 'Download failed after 3 attempts: https://example.com/file.bin (the connection timed out)' in result.stdout
+        assert not destination.exists()
