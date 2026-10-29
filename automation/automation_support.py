@@ -536,7 +536,7 @@ class Config:
         rule_name = text('FIREWALL_RULE_NAME') if 'FIREWALL_RULE_NAME' in data else selectors.get('rule_name', '')
         if rule_name and not RULE_NAME.fullmatch(rule_name):
             problems.append(f'{rule_field} must be 1-64 letters, digits, underscores or hyphens, starting with a letter or digit (or blank for this computer\'s default)')
-        # Blank: a per-computer, per-user name, so machines sharing an environment never collide.
+        # Blank: a per-computer, per-user name, so machines sharing an environment use different names.
         selectors['rule_name'] = rule_name or default_rule_name()
         if selectors.get('expiry_format', '') not in {'', 'iso8601', 'lcs_utc'}:
             problems.append('selectors.expiry_format must be iso8601 or lcs_utc')

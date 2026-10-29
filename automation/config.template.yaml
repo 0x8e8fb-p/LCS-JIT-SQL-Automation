@@ -10,9 +10,10 @@ ACCESS_REASON: "AX troubleshooting (read-only to AX)"
 # Approved justification for the Request access block.
 ACCESS_DETAILS: ""
 
-# Temporary firewall rule name. Leave blank to use this computer's own name,
-# lcsjit-<8 characters> (shown by .\run.cmd -ValidateOnly), so computers sharing
-# an environment never collide. An existing rule is never overwritten.
+# Temporary firewall rule name. Leave blank to use a name for this computer and
+# Windows user, lcsjit-<8 characters> (shown by .\run.cmd -ValidateOnly), so
+# computers sharing an environment use different names. An existing rule is
+# never overwritten.
 FIREWALL_RULE_NAME: ""
 
 # Optional: the public IPv4 address your SQL traffic leaves from. Set it only when

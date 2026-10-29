@@ -1,1 +1,4 @@
 config.yaml
+*.local.yaml
+/.auth/
+/logs/

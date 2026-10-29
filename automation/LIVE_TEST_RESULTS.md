@@ -1,5 +1,44 @@
 # Setup verification and historical live results
 
+## New-machine reliability changes — 2026-10-29
+
+**Reviewed failure:** the launcher worked on the computer it was developed on, but new computers failed one error at a time. An audit of the launchers, setup, runtime code, tests and documentation found these machine-dependent causes:
+
+- Launch: the default execution policy and the download mark blocked `run.ps1`, and LF line endings can break the labels in `automation\run.cmd`.
+- Python: setup used whichever Python the computer had (system, `py` launcher, registry) or a python.org installer that could register a per-user Python.
+- Network: proxies, PAC files, TLS inspection and blocked hosts appeared as late, unrelated errors. `PUBLIC_IP` could not be set in `config.yaml`, and IP detection went through the web proxy although SQL traffic goes direct.
+- Region: LCS expiry dates were parsed in one US format and the browser locale followed the computer, so other regional formats failed.
+- Timing: fixed waits assumed the development computer's speed.
+- Sharing: every computer used the same firewall rule name for an environment.
+- Sign-in: a key from another Windows user or computer caused a sign-in loop, and locked files failed runs.
+- Errors: generic messages hid the cause.
+- Tests: the suite depended on the developer's computer (personal config, pyodbc, PowerShell, Chromium).
+
+**Changes (Tasks 1–13 plus two review-fix commits, on top of the last commit of 2026-10-15):**
+
+- Launch: root `run.cmd` starts 64-bit Windows PowerShell with `-ExecutionPolicy Bypass` for its own process; `run.ps1` removes the download mark from the launcher scripts; `.gitattributes` keeps CRLF for `.cmd`, `.bat` and `.ps1` files.
+- Setup: a preflight that lists every local blocker; a clean child environment; one download check before anything is installed; CPython 3.13.16 from the nuget.org package, verified by size and SHA-512; a venv rebuilt when the runtime or folder changes; exact pins plus `pip check`; ODBC Driver 18 installation that handles 1223, 1618, 1641 and 3010; full Chromium installed with `--no-shell`.
+- Runtime: the full Chromium with en-US and UTC in every mode; expiry parsing for other regional formats that fails closed when ambiguous; waits for LCS conditions instead of fixed delays; a per-computer default rule name; `PUBLIC_IP` in `config.yaml`; direct-first IP detection; Azure SQL connection retries and the 40615 address-mismatch message; DPAPI key rotation; atomic sign-in writes that retry locked files.
+- Errors: configuration problems listed together; diagnostics with only class names, codes and categories; new steps `browser_start`, `network` and `auth_state_write`.
+- Tests and docs: a machine-independent suite with `windows`, `powershell`, `chromium` and `integration` markers; the README rewritten around `.\run.cmd`; tests that keep README anchors, links and launcher options in step with the code.
+
+**Verified on macOS arm64 (2026-10-29), not Windows:** Python 3.12.14 with the pinned runtime and development packages, PowerShell 7.6.9 (`pwsh`), Playwright Chromium build 1243.
+
+- Full suite: **214 passed, 4 skipped**. The skips are the pyodbc child-process drift probe (needs an ODBC driver manager), the two opt-in integration tests (`LCSJIT_INTEGRATION=1`) and the `cmd.exe` argument-forwarding test (Windows only). Before these changes the same macOS run had 37 passed, 3 failed, 4 skipped and 4 collection errors.
+- mypy with `--platform win32` on the five runtime modules: clean. PowerShell parser on `run.ps1` and `automation/setup.ps1`: 0 errors. The `.ps1` and `.cmd` files are ASCII only.
+- `git archive`, which GitHub ZIP downloads are built with, produces CRLF line endings for the `.cmd` and `.ps1` files.
+- The real `python.3.13.16.nupkg` from nuget.org has 14,817,881 bytes and the SHA-512 published in the nuget.org catalog. `Expand-PythonPackage` extracted its 1,331 `tools/` files under `pwsh`; the Windows binaries were not executed.
+- Download locations checked online: the ODBC link `https://go.microsoft.com/fwlink/?linkid=2378279` resolves to the Driver 18.7.1.1 MSI on download.microsoft.com, and Playwright's Windows Chromium comes from cdn.playwright.dev, which redirects to storage.googleapis.com.
+
+**Pending Windows verification:** none of these changes has run on Windows yet.
+
+1. A clean computer or Windows Sandbox with a ZIP download: `.\run.cmd`, fill in `config.yaml`, then `.\run.cmd -ValidateOnly`. Expect at most one UAC prompt (ODBC driver) and no Python entry in *Installed apps* or PATH.
+2. The development computer after `git pull`: `.\run.cmd -ValidateOnly` (the venv is rebuilt once from the nuget.org runtime), then a full `.\run.cmd`. Check `status`, `lcs_date_format` and `cleanup` in `report.json`.
+3. A computer with the English (India) or English (United Kingdom) regional format: a full run.
+4. A corporate network: proxy and certificate handling, or the blocked-host list.
+5. The test suite on Windows: `pip install -r automation\requirements-dev.txt`, `pytest automation\tests -rs`, then again with `$env:LCSJIT_INTEGRATION = '1'`.
+6. Behavior so far tested only with mocks: Windows PowerShell 5.1 itself, UAC elevation through `Process.Start` and a declined prompt (1223), the wait on the `Global\_MSIExecute` mutex, the download probes, the Windows certificate export, real DPAPI, and live LCS and SQL.
+
 ## Registration-free local Python installation — 2026-10-15
 
 **Reviewed inconsistency:** the setup contract promises a project-local interpreter ("no PATH changes", "no system-wide Python"), but the preferred install path ran the official per-user bundle installer. A per-user bundle install registers Windows Installer products, an *Installed apps* entry and `HKCU\Software\Python\PythonCore\3.13\InstallPath`, all pointing at `automation/runtime/python/`. Deleting or moving the project folder — which the documentation itself asks for when moving machines ("download a fresh source copy", do not transfer `runtime/`) — therefore left a registered Python whose `InstallDirectory` no longer existed. Every later run was a no-op *Modify*, `/uninstall` failed (1603 from `pip.msi`: the earlier failure on this host), and other Python tooling still saw a bogus 3.13 installation.
@@ -52,7 +91,7 @@
 
 ### Limits
 
-No pristine VM was available. The host already has Microsoft ODBC Driver 17, so actual missing-driver/UAC installation of Driver 18.7 is **not certified**; official download/signature and mocked install/failure/restart branches are verified. Python-missing installation was exercised with a real local installer in the earlier clean-copy test below, not by uninstalling host Python. Interactive MFA/UAC still require user action. Only approved SELECT samples ran against this one LCS-managed sandbox; no arbitrary writes, other tenants, PPAC, other OS/architectures or unattended expired-MFA recovery are certified. Local locks do not serialize manual operations/other machines, and termination/power loss cannot guarantee cleanup. The repository changes have not been committed or pushed by this audit; a remote GitHub download receives them only after an authorized publication step.
+No pristine VM was available. The host already has Microsoft ODBC Driver 17, so actual missing-driver/UAC installation of Driver 18.7 is **not certified**; official download/signature and mocked install/failure/restart branches are verified. Python-missing installation was exercised with a real local installer in the earlier clean-copy test below, not by uninstalling host Python. Interactive MFA/UAC still require user action. Only approved SELECT samples ran against this one LCS-managed sandbox; no arbitrary writes, other tenants, PPAC, other OS/architectures or unattended expired-MFA recovery are certified. Local locks do not serialize manual operations/other machines, and termination/power loss cannot guarantee cleanup. At the time of this audit its repository changes had not been committed or pushed (historical: they were committed and published later that day).
 
 ## Simplified setup verification — 2026-10-13
 
